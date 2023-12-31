@@ -149,6 +149,8 @@ struct motu_avb {
 			dma_addr_t dma;
 		} buffers[MAX_MEMORY_BUFFERS];
 	} capture, playback;
+	
+	unsigned int next_playback_frame;
 };
 
 static DEFINE_MUTEX(devices_mutex);
@@ -372,6 +374,11 @@ static void playback_urb_complete(struct urb *usb_urb)
 		abort_alsa_playback(ua);
 		return;
 	}
+	
+	if ((urb->urb.start_frame & 0x3ff) != ua->next_playback_frame) {
+		printk(KERN_WARNING "ISOC delay %u!\n", (urb->urb.start_frame & 0x3ff) - ua->next_playback_frame);
+	}
+	ua->next_playback_frame = (urb->urb.start_frame + urb->urb.number_of_packets) & 0x3ff;
 
 	if (test_bit(USB_PLAYBACK_RUNNING, &ua->states)) {
 		/* append URB to FIFO */
@@ -389,6 +396,8 @@ static void playback_urb_complete(struct urb *usb_urb)
 static void first_playback_urb_complete(struct urb *urb)
 {
 	struct motu_avb *ua = urb->context;
+	
+	ua->next_playback_frame = urb->start_frame & 0x3ff;
 
 	urb->complete = playback_urb_complete;
 	playback_urb_complete(urb);
@@ -578,6 +587,7 @@ static void disable_iso_interface(struct motu_avb *ua, unsigned int intf_index)
 static void stop_usb_capture(struct motu_avb *ua)
 {
 	clear_bit(USB_CAPTURE_RUNNING, &ua->states);
+	printk(KERN_WARNING "Stop capture called\n");
 
 	kill_stream_urbs(&ua->capture);
 
@@ -594,6 +604,8 @@ static void stop_usb_capture(struct motu_avb *ua)
 static int start_usb_capture(struct motu_avb *ua)
 {
 	int err = 0;
+	
+	printk(KERN_WARNING "Start capture called\n");
 
 	if (test_bit(DISCONNECTED, &ua->states))
 		return -ENODEV;
@@ -628,11 +640,10 @@ static int start_usb_capture(struct motu_avb *ua)
 
 static void stop_usb_playback(struct motu_avb *ua)
 {
+	printk(KERN_WARNING "Stop playback called\n");
 	clear_bit(USB_PLAYBACK_RUNNING, &ua->states);
 
 	kill_stream_urbs(&ua->playback);
-
-	//tasklet_kill(&ua->playback_tasklet);
 
 	if (vendor)
 	{
@@ -646,6 +657,7 @@ static void stop_usb_playback(struct motu_avb *ua)
 
 static int start_usb_playback(struct motu_avb *ua)
 {
+	printk(KERN_WARNING "Start playback called\n");
 	unsigned int i, frames;
 	struct urb *urb;
 	int err = 0;
