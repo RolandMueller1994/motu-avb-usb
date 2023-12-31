@@ -37,7 +37,7 @@ MODULE_LICENSE("GPL v2");
  */
 #define DEFAULT_QUEUE_LENGTH	21
 
-#define MAX_PACKET_SIZE		(24*3*25) /* hardware specific */
+#define MAX_PACKET_SIZE		1728 /* hardware specific */
 #define MAX_MEMORY_BUFFERS	DIV_ROUND_UP(MAX_QUEUE_LENGTH, \
 					     PAGE_SIZE / MAX_PACKET_SIZE)
 
@@ -126,7 +126,6 @@ struct motu_avb {
 	u8 rate_feedback[MAX_QUEUE_LENGTH];
 
 	struct list_head ready_playback_urbs;
-	struct tasklet_struct playback_tasklet;
 	wait_queue_head_t alsa_capture_wait;
 	wait_queue_head_t rate_feedback_wait;
 	wait_queue_head_t alsa_playback_wait;
@@ -190,7 +189,7 @@ static void set_samplerate(struct motu_avb *ua)
 
         ua->samplerate_is_set = true;
 
-        dev_warn(&ua->dev->dev, "Motu driver 0.2\n");
+        dev_warn(&ua->dev->dev, "Motu driver 0.4\n");
 
         kfree(data_buf);
 
@@ -254,45 +253,6 @@ static void abort_usb_playback(struct motu_avb *ua)
 		wake_up(&ua->alsa_playback_wait);
 }
 
-static void playback_urb_complete(struct urb *usb_urb)
-{
-	struct motu_avb_urb *urb = (struct motu_avb_urb *)usb_urb;
-	struct motu_avb *ua = urb->urb.context;
-	unsigned long flags;
-
-	if (unlikely(urb->urb.status == -ENOENT ||	/* unlinked */
-		     urb->urb.status == -ENODEV ||	/* device removed */
-		     urb->urb.status == -ECONNRESET ||	/* unlinked */
-		     urb->urb.status == -ESHUTDOWN)) {	/* device disabled */
-		abort_usb_playback(ua);
-		abort_alsa_playback(ua);
-		return;
-	}
-
-	if (test_bit(USB_PLAYBACK_RUNNING, &ua->states)) {
-		/* append URB to FIFO */
-		spin_lock_irqsave(&ua->lock, flags);
-		list_add_tail(&urb->ready_list, &ua->ready_playback_urbs);
-		if (ua->rate_feedback_count > 0)
-			tasklet_schedule(&ua->playback_tasklet);
-		ua->playback.substream->runtime->delay -=
-				urb->urb.iso_frame_desc[0].length /
-						ua->playback.frame_bytes;
-		spin_unlock_irqrestore(&ua->lock, flags);
-	}
-}
-
-static void first_playback_urb_complete(struct urb *urb)
-{
-	struct motu_avb *ua = urb->context;
-
-	urb->complete = playback_urb_complete;
-	playback_urb_complete(urb);
-
-	set_bit(PLAYBACK_URB_COMPLETED, &ua->states);
-	wake_up(&ua->alsa_playback_wait);
-}
-
 /* copy data from the ALSA ring buffer into the URB buffer */
 static bool copy_playback_data(struct motu_avb_stream *stream, struct urb *urb,
 			       unsigned int frames)
@@ -333,9 +293,10 @@ static inline void add_with_wraparound(struct motu_avb *ua,
 		*value -= ua->playback.queue_length;
 }
 
-static void playback_tasklet(unsigned long data)
+static void playback_tasklet(struct motu_avb *data)
 {
-	struct motu_avb *ua = (void *)data;
+	//struct motu_avb *ua = (void *)data;
+	struct motu_avb *ua = data;
 	unsigned long flags;
 	unsigned int frames;
 	struct motu_avb_urb *urb;
@@ -395,6 +356,45 @@ static void playback_tasklet(unsigned long data)
 	spin_unlock_irqrestore(&ua->lock, flags);
 	if (do_period_elapsed)
 		snd_pcm_period_elapsed(ua->playback.substream);
+}
+
+static void playback_urb_complete(struct urb *usb_urb)
+{
+	struct motu_avb_urb *urb = (struct motu_avb_urb *)usb_urb;
+	struct motu_avb *ua = urb->urb.context;
+	unsigned long flags;
+
+	if (unlikely(urb->urb.status == -ENOENT ||	/* unlinked */
+		     urb->urb.status == -ENODEV ||	/* device removed */
+		     urb->urb.status == -ECONNRESET ||	/* unlinked */
+		     urb->urb.status == -ESHUTDOWN)) {	/* device disabled */
+		abort_usb_playback(ua);
+		abort_alsa_playback(ua);
+		return;
+	}
+
+	if (test_bit(USB_PLAYBACK_RUNNING, &ua->states)) {
+		/* append URB to FIFO */
+		spin_lock_irqsave(&ua->lock, flags);
+		list_add_tail(&urb->ready_list, &ua->ready_playback_urbs);
+		ua->playback.substream->runtime->delay -=
+				urb->urb.iso_frame_desc[0].length /
+						ua->playback.frame_bytes;
+		spin_unlock_irqrestore(&ua->lock, flags);
+		if (ua->rate_feedback_count > 0)
+			playback_tasklet(ua);
+	}
+}
+
+static void first_playback_urb_complete(struct urb *urb)
+{
+	struct motu_avb *ua = urb->context;
+
+	urb->complete = playback_urb_complete;
+	playback_urb_complete(urb);
+
+	set_bit(PLAYBACK_URB_COMPLETED, &ua->states);
+	wake_up(&ua->alsa_playback_wait);
 }
 
 /* copy data from the URB buffer into the ALSA ring buffer */
@@ -485,16 +485,16 @@ static void capture_urb_complete(struct urb *urb)
 			 */
 			add_with_wraparound(ua, &ua->rate_feedback_start, 1);
 		}
-		if (test_bit(USB_PLAYBACK_RUNNING, &ua->states) &&
-		    !list_empty(&ua->ready_playback_urbs))
-			tasklet_schedule(&ua->playback_tasklet);
 	}
 
 	spin_unlock_irqrestore(&ua->lock, flags);
 
 	if (do_period_elapsed)
 		snd_pcm_period_elapsed(stream->substream);
-
+		
+	if (test_bit(USB_PLAYBACK_RUNNING, &ua->states) &&
+		    !list_empty(&ua->ready_playback_urbs))
+		    playback_tasklet(ua);
 	return;
 
 stream_stopped:
@@ -632,7 +632,7 @@ static void stop_usb_playback(struct motu_avb *ua)
 
 	kill_stream_urbs(&ua->playback);
 
-	tasklet_kill(&ua->playback_tasklet);
+	//tasklet_kill(&ua->playback_tasklet);
 
 	if (vendor)
 	{
@@ -656,7 +656,7 @@ static int start_usb_playback(struct motu_avb *ua)
 	clear_bit(USB_PLAYBACK_RUNNING, &ua->states);
 
 	kill_stream_urbs(&ua->playback);
-	tasklet_kill(&ua->playback_tasklet);
+	//tasklet_kill(&ua->playback_tasklet);
 
 	if (vendor)
 	{
@@ -1338,13 +1338,11 @@ static int motu_avb_probe(struct usb_interface *interface,
 	spin_lock_init(&ua->lock);
 	mutex_init(&ua->mutex);
 	INIT_LIST_HEAD(&ua->ready_playback_urbs);
-	tasklet_init(&ua->playback_tasklet,
-		     playback_tasklet, (unsigned long)ua);
 	init_waitqueue_head(&ua->alsa_capture_wait);
 	init_waitqueue_head(&ua->rate_feedback_wait);
 	init_waitqueue_head(&ua->alsa_playback_wait);
 
-        dev_info(&ua->dev->dev, "samplerate = %d, queue_length = %d, midi = %d, vendor = %d\n", samplerate, queue_length, midi, vendor);
+    dev_info(&ua->dev->dev, "samplerate = %d, queue_length = %d, midi = %d, vendor = %d\n", samplerate, queue_length, midi, vendor);
 
 	ua->intf[0] = interface;
 	for (i = 1; i < ARRAY_SIZE(ua->intf); ++i) {
