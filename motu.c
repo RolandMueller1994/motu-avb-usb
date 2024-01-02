@@ -35,7 +35,7 @@ MODULE_LICENSE("GPL v2");
  * sizes at all sample rates, taking into account the stupid cache pool sizes
  * that usb_alloc_coherent() uses.
  */
-#define DEFAULT_QUEUE_LENGTH	21
+#define DEFAULT_QUEUE_LENGTH	24
 
 #define MAX_PACKET_SIZE		1728 /* hardware specific */
 #define MAX_MEMORY_BUFFERS	DIV_ROUND_UP(MAX_QUEUE_LENGTH, \
@@ -105,6 +105,19 @@ enum {
 	DISCONNECTED,
 };
 
+//			struct usb_iso_packet_descriptor iso_frame_desc[1];
+
+struct motu_avb;
+
+struct motu_avb_urb {
+	struct urb * urb;
+	struct motu_avb * ua;
+	unsigned int packets;
+	unsigned int buffer_size;
+	//struct usb_iso_packet_descriptor iso_frame_desc[1];
+	struct list_head ready_list;
+};
+
 struct motu_avb {
 	struct usb_device *dev;
 	struct snd_card *card;
@@ -138,16 +151,12 @@ struct motu_avb {
 		unsigned int period_pos;
 		unsigned int buffer_pos;
 		unsigned int queue_length;
-		struct motu_avb_urb {
-			struct urb urb;
-			struct usb_iso_packet_descriptor iso_frame_desc[1];
-			struct list_head ready_list;
-		} *urbs[MAX_QUEUE_LENGTH];
-		struct {
+		struct motu_avb_urb urbs[DEFAULT_QUEUE_LENGTH];
+		/*struct {
 			unsigned int size;
 			void *addr;
 			dma_addr_t dma;
-		} buffers[MAX_MEMORY_BUFFERS];
+		} buffers[MAX_MEMORY_BUFFERS];*/
 	} capture, playback;
 	
 	unsigned int next_playback_frame;
@@ -232,10 +241,13 @@ static const char *usb_error_string(int err)
 	case -EHOSTUNREACH:
 		return "device suspended";
 	case -EINVAL:
+		return "einval";
 	case -EAGAIN:
+		return "again";
 	case -EFBIG:
+		return "big";
 	case -EMSGSIZE:
-		return "internal error";
+		return "msgsize";
 	default:
 		return "unknown error";
 	}
@@ -333,18 +345,18 @@ static void playback_tasklet(struct motu_avb *data)
 		list_del(&urb->ready_list);
 
 		/* fill packet with data or silence */
-		urb->urb.iso_frame_desc[0].length =
+		urb->urb->iso_frame_desc[0].length =
 			frames * ua->playback.frame_bytes;
 		if (test_bit(ALSA_PLAYBACK_RUNNING, &ua->states))
 			do_period_elapsed |= copy_playback_data(&ua->playback,
-								&urb->urb,
+								urb->urb,
 								frames);
 		else
-			memset(urb->urb.transfer_buffer, 0,
-			       urb->urb.iso_frame_desc[0].length);
+			memset(urb->urb->transfer_buffer, 0,
+			       urb->urb->iso_frame_desc[0].length);
 
 		/* and off you go ... */
-		err = usb_submit_urb(&urb->urb, GFP_ATOMIC);
+		err = usb_submit_urb(urb->urb, GFP_ATOMIC);
 		if (unlikely(err < 0)) {
 			spin_unlock_irqrestore(&ua->lock, flags);
 			abort_usb_playback(ua);
@@ -360,32 +372,32 @@ static void playback_tasklet(struct motu_avb *data)
 		snd_pcm_period_elapsed(ua->playback.substream);
 }
 
-static void playback_urb_complete(struct urb *usb_urb)
+static void playback_urb_complete(struct urb *urb)
 {
-	struct motu_avb_urb *urb = (struct motu_avb_urb *)usb_urb;
-	struct motu_avb *ua = urb->urb.context;
+	//struct motu_avb_urb *urb = (struct motu_avb_urb *)usb_urb;
+	struct motu_avb *ua = ((struct motu_avb_urb *)urb->context)->ua;
 	unsigned long flags;
 
-	if (unlikely(urb->urb.status == -ENOENT ||	/* unlinked */
-		     urb->urb.status == -ENODEV ||	/* device removed */
-		     urb->urb.status == -ECONNRESET ||	/* unlinked */
-		     urb->urb.status == -ESHUTDOWN)) {	/* device disabled */
+	if (unlikely(urb->status == -ENOENT ||	/* unlinked */
+		     urb->status == -ENODEV ||	/* device removed */
+		     urb->status == -ECONNRESET ||	/* unlinked */
+		     urb->status == -ESHUTDOWN)) {	/* device disabled */
 		abort_usb_playback(ua);
 		abort_alsa_playback(ua);
 		return;
 	}
 	
-	if ((urb->urb.start_frame & 0x3ff) != ua->next_playback_frame) {
-		printk(KERN_WARNING "ISOC delay %u!\n", (urb->urb.start_frame & 0x3ff) - ua->next_playback_frame);
+	if ((urb->start_frame & 0x3ff) != ua->next_playback_frame) {
+		printk(KERN_WARNING "ISOC delay %u!\n", (urb->start_frame & 0x3ff) - ua->next_playback_frame);
 	}
-	ua->next_playback_frame = (urb->urb.start_frame + urb->urb.number_of_packets) & 0x3ff;
+	ua->next_playback_frame = (urb->start_frame + urb->number_of_packets) & 0x3ff;
 
 	if (test_bit(USB_PLAYBACK_RUNNING, &ua->states)) {
 		/* append URB to FIFO */
 		spin_lock_irqsave(&ua->lock, flags);
-		list_add_tail(&urb->ready_list, &ua->ready_playback_urbs);
+		list_add_tail(&((struct motu_avb_urb *)urb->context)->ready_list, &ua->ready_playback_urbs);
 		ua->playback.substream->runtime->delay -=
-				urb->urb.iso_frame_desc[0].length /
+				urb->iso_frame_desc[0].length /
 						ua->playback.frame_bytes;
 		spin_unlock_irqrestore(&ua->lock, flags);
 		if (ua->rate_feedback_count > 0)
@@ -395,7 +407,7 @@ static void playback_urb_complete(struct urb *usb_urb)
 
 static void first_playback_urb_complete(struct urb *urb)
 {
-	struct motu_avb *ua = urb->context;
+	struct motu_avb *ua = ((struct motu_avb_urb *)urb->context)->ua;
 	
 	ua->next_playback_frame = urb->start_frame & 0x3ff;
 
@@ -441,7 +453,7 @@ static bool copy_capture_data(struct motu_avb_stream *stream, struct urb *urb,
 
 static void capture_urb_complete(struct urb *urb)
 {
-	struct motu_avb *ua = urb->context;
+	struct motu_avb *ua = ((struct motu_avb_urb *)urb->context)->ua;
 	struct motu_avb_stream *stream = &ua->capture;
 	unsigned long flags;
 	unsigned int frames, write_ptr;
@@ -504,6 +516,8 @@ static void capture_urb_complete(struct urb *urb)
 	if (test_bit(USB_PLAYBACK_RUNNING, &ua->states) &&
 		    !list_empty(&ua->ready_playback_urbs))
 		    playback_tasklet(ua);
+	/*if (list_empty(&ua->ready_playback_urbs))
+		printk(KERN_WARNING "No playback urbs\n");*/
 	return;
 
 stream_stopped:
@@ -515,7 +529,7 @@ stream_stopped:
 
 static void first_capture_urb_complete(struct urb *urb)
 {
-	struct motu_avb *ua = urb->context;
+	struct motu_avb *ua = ((struct motu_avb_urb *)urb->context)->ua;
 
 	urb->complete = capture_urb_complete;
 	capture_urb_complete(urb);
@@ -527,9 +541,11 @@ static void first_capture_urb_complete(struct urb *urb)
 static int submit_stream_urbs(struct motu_avb *ua, struct motu_avb_stream *stream)
 {
 	unsigned int i;
+	struct urb *urb;
 
 	for (i = 0; i < stream->queue_length; ++i) {
-		int err = usb_submit_urb(&stream->urbs[i]->urb, GFP_KERNEL);
+		urb = stream->urbs[i].urb;
+		int err = usb_submit_urb(stream->urbs[i].urb, GFP_KERNEL);
 		if (err < 0) {
 			dev_err(&ua->dev->dev, "USB request error %d: %s\n",
 				err, usb_error_string(err));
@@ -544,8 +560,7 @@ static void kill_stream_urbs(struct motu_avb_stream *stream)
 	unsigned int i;
 
 	for (i = 0; i < stream->queue_length; ++i)
-		if (stream->urbs[i])
-			usb_kill_urb(&stream->urbs[i]->urb);
+		usb_kill_urb(stream->urbs[i].urb);
 }
 
 static int enable_iso_interface(struct motu_avb *ua, unsigned int intf_index)
@@ -627,11 +642,12 @@ static int start_usb_capture(struct motu_avb *ua)
 		return err;
 
 	clear_bit(CAPTURE_URB_COMPLETED, &ua->states);
-	ua->capture.urbs[0]->urb.complete = first_capture_urb_complete;
+	ua->capture.urbs[0].urb->complete = first_capture_urb_complete;
 	ua->rate_feedback_start = 0;
 	ua->rate_feedback_count = 0;
 
 	set_bit(USB_CAPTURE_RUNNING, &ua->states);
+	printk(KERN_WARNING "Before submit stream\n");
 	err = submit_stream_urbs(ua, &ua->capture);
 	if (err < 0)
 		stop_usb_capture(ua);
@@ -658,7 +674,7 @@ static void stop_usb_playback(struct motu_avb *ua)
 static int start_usb_playback(struct motu_avb *ua)
 {
 	printk(KERN_WARNING "Start playback called\n");
-	unsigned int i, frames;
+	unsigned int i, frames; // i, 
 	struct urb *urb;
 	int err = 0;
 
@@ -682,7 +698,7 @@ static int start_usb_playback(struct motu_avb *ua)
 		return err;
 
 	clear_bit(PLAYBACK_URB_COMPLETED, &ua->states);
-	ua->playback.urbs[0]->urb.complete =
+	ua->playback.urbs[0].urb->complete =
 		first_playback_urb_complete;
 	spin_lock_irq(&ua->lock);
 	INIT_LIST_HEAD(&ua->ready_playback_urbs);
@@ -750,24 +766,26 @@ static int start_usb_playback(struct motu_avb *ua)
 
 	spin_unlock_irq(&ua->lock);
 
-	urb = &ua->playback.urbs[0]->urb;
+	urb = ua->playback.urbs[0].urb;
 	urb->iso_frame_desc[0].length =
 		frames * ua->playback.frame_bytes;
 	memset(urb->transfer_buffer, 0,
 	       urb->iso_frame_desc[0].length);
 
 	for (i = 1; i < ua->playback.queue_length; ++i) {
-		/* all initial URBs contain silence */
+		printk(KERN_WARNING "Init urb %u\n", i);
+		// all initial URBs contain silence
 		spin_lock_irq(&ua->lock);
 		frames = ua->rate_feedback[ua->rate_feedback_start];
 		add_with_wraparound(ua, &ua->rate_feedback_start, 1);
 		ua->rate_feedback_count--;
 		spin_unlock_irq(&ua->lock);
-		urb = &ua->playback.urbs[i]->urb;
+		urb = ua->playback.urbs[i].urb;
 		urb->iso_frame_desc[0].length =
 			frames * ua->playback.frame_bytes;
 		memset(urb->transfer_buffer, 0,
 		       urb->iso_frame_desc[0].length);
+		printk(KERN_WARNING "urb length %u\n", urb->iso_frame_desc[0].length);
 	}
 
 	set_bit(USB_PLAYBACK_RUNNING, &ua->states);
@@ -775,6 +793,9 @@ static int start_usb_playback(struct motu_avb *ua)
 	if (err < 0)
 		stop_usb_playback(ua);
 	return err;
+	
+	//set_bit(USB_PLAYBACK_RUNNING, &ua->states);
+	return 0;
 }
 
 static void abort_alsa_capture(struct motu_avb *ua)
@@ -1142,7 +1163,7 @@ static int detect_usb_format(struct motu_avb *ua)
 	return 0;
 }
 
-static int alloc_stream_buffers(struct motu_avb *ua, struct motu_avb_stream *stream)
+/*static int alloc_stream_buffers(struct motu_avb *ua, struct motu_avb_stream *stream)
 {
 	unsigned int remaining_packets, packets, packets_per_page, i;
 	size_t size;
@@ -1153,13 +1174,17 @@ static int alloc_stream_buffers(struct motu_avb *ua, struct motu_avb_stream *str
 	stream->queue_length = min(stream->queue_length,
 				   (unsigned int)MAX_QUEUE_LENGTH);
 
-	/*
+	//
 	 * The cache pool sizes used by usb_alloc_coherent() (128, 512, 2048) are
 	 * quite bad when used with the packet sizes of this device (e.g. 280,
 	 * 520, 624).  Therefore, we allocate and subdivide entire pages, using
 	 * a smaller buffer only for the last chunk.
-	 */
+	//
 	remaining_packets = stream->queue_length;
+	
+	for (i = 0; i < remaining_packets; i++) {
+		;
+	}
 	packets_per_page = PAGE_SIZE / stream->max_packet_bytes;
 	for (i = 0; i < ARRAY_SIZE(stream->buffers); ++i) {
 		packets = min(remaining_packets, packets_per_page);
@@ -1190,16 +1215,45 @@ static void free_stream_buffers(struct motu_avb *ua, struct motu_avb_stream *str
 				  stream->buffers[i].size,
 				  stream->buffers[i].addr,
 				  stream->buffers[i].dma);
-}
+}*/
 
 static int alloc_stream_urbs(struct motu_avb *ua, struct motu_avb_stream *stream,
 			     void (*urb_complete)(struct urb *))
 {
 	unsigned max_packet_size = stream->max_packet_bytes;
-	struct motu_avb_urb *urb;
-	unsigned int b, u = 0;
+	struct motu_avb_urb *urb_ctx;
+	unsigned int urb_no, urb_packs; // b, u = 0, 
+	
+	stream->queue_length = queue_length;
+	urb_packs = 1;
+	
+	for (urb_no = 0; urb_no < stream->queue_length; urb_no++) {
+		urb_ctx = &stream->urbs[urb_no];
+		urb_ctx->ua = ua;
+		urb_ctx->packets = urb_packs;
+		urb_ctx->buffer_size = max_packet_size * urb_ctx->packets;
+		
+		urb_ctx->urb = usb_alloc_urb(urb_ctx->packets, GFP_KERNEL);
+		if (!urb_ctx->urb)
+			return -ENOMEM;
+		usb_init_urb(urb_ctx->urb);	
+		
+		urb_ctx->urb->transfer_buffer = usb_alloc_coherent(ua->dev, urb_ctx->buffer_size, GFP_KERNEL, &urb_ctx->urb->transfer_dma);
+		if (!urb_ctx->urb->transfer_buffer)
+			return -ENOMEM;
+		urb_ctx->urb->dev = ua->dev;
+		urb_ctx->urb->pipe = stream->usb_pipe;
+		urb_ctx->urb->transfer_flags = URB_NO_TRANSFER_DMA_MAP;
+		urb_ctx->urb->interval = 1;
+		urb_ctx->urb->transfer_buffer_length = max_packet_size;
+		urb_ctx->urb->number_of_packets = 1;
+		urb_ctx->urb->context = urb_ctx;
+		urb_ctx->urb->complete = urb_complete;
+		urb_ctx->urb->iso_frame_desc[0].offset = 0;
+		urb_ctx->urb->iso_frame_desc[0].length = max_packet_size;
+	}
 
-	for (b = 0; b < ARRAY_SIZE(stream->buffers); ++b) {
+	/*for (b = 0; b < ARRAY_SIZE(stream->buffers); ++b) {
 		unsigned int size = stream->buffers[b].size;
 		u8 *addr = stream->buffers[b].addr;
 		dma_addr_t dma = stream->buffers[b].dma;
@@ -1229,21 +1283,31 @@ static int alloc_stream_urbs(struct motu_avb *ua, struct motu_avb_stream *stream
 			dma += max_packet_size;
 		}
 	}
-	if (u == stream->queue_length)
-		return 0;
-bufsize_error:
+	if (u == stream->queue_length)*/
+	return 0;
+/*bufsize_error:
 	dev_err(&ua->dev->dev, "internal buffer size error\n");
-	return -ENXIO;
+	return -ENXIO;*/
 }
 
 static void free_stream_urbs(struct motu_avb_stream *stream)
 {
-	unsigned int i;
+	unsigned int urb_no; // i, 
+	struct motu_avb_urb * urb_ctx;
 
-	for (i = 0; i < stream->queue_length; ++i) {
+	for (urb_no = 0; urb_no < stream->queue_length; urb_no++) {
+		urb_ctx = &stream->urbs[urb_no];
+		if (urb_ctx->urb && urb_ctx->buffer_size) 
+			usb_free_coherent(urb_ctx->ua->dev, urb_ctx->buffer_size, urb_ctx->urb->transfer_buffer, urb_ctx->urb->transfer_dma);
+		usb_free_urb(urb_ctx->urb);
+		urb_ctx->urb = NULL;
+		urb_ctx->buffer_size = 0;
+	}
+
+	/*for (i = 0; i < stream->queue_length; ++i) {
 		kfree(stream->urbs[i]);
 		stream->urbs[i] = NULL;
-	}
+	}*/
 }
 
 static void free_usb_related_resources(struct motu_avb *ua,
@@ -1256,8 +1320,8 @@ static void free_usb_related_resources(struct motu_avb *ua,
 	free_stream_urbs(&ua->capture);
 	free_stream_urbs(&ua->playback);
 	mutex_unlock(&ua->mutex);
-	free_stream_buffers(ua, &ua->capture);
-	free_stream_buffers(ua, &ua->playback);
+	//free_stream_buffers(ua, &ua->capture);
+	//free_stream_buffers(ua, &ua->playback);
 
 	for (i = 0; i < ARRAY_SIZE(ua->intf); ++i) {
 		mutex_lock(&ua->mutex);
@@ -1393,13 +1457,13 @@ static int motu_avb_probe(struct usb_interface *interface,
 	snprintf(ua->card->longname, sizeof(ua->card->longname),
 		 "MOTU %s", ua->dev->product);
 
-	err = alloc_stream_buffers(ua, &ua->capture);
+	/*err = alloc_stream_buffers(ua, &ua->capture);
 	if (err < 0)
 		goto probe_error;
 	err = alloc_stream_buffers(ua, &ua->playback);
 	if (err < 0)
 		goto probe_error;
-
+	*/
 	err = alloc_stream_urbs(ua, &ua->capture, capture_urb_complete);
 	if (err < 0)
 		goto probe_error;
