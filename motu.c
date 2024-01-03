@@ -3,6 +3,7 @@
  * Motu AVB driver
  * Copyright (c) Clemens Ladisch <clemens@ladisch.de> (original UA101/UA1000 driver)
  * Copyright (c) Ralf Beck <ralfbeck1@gmx.de> (adaptation for Motu AVB series)
+ * Copyright (c) Roland Mueller <roland.mueller.1994@gmx.de> (adaptation for Motu AVB ESS. Variable URB sizes, start_frame checks, ...)
  */
 
 #include <linux/init.h>
@@ -19,7 +20,7 @@
 #include "midi.h"
 
 MODULE_DESCRIPTION("Motu AVB driver");
-MODULE_AUTHOR("Ralf Beck <ralfbeck1@gmx.de>");
+MODULE_AUTHOR("Roland Mueller <roland.mueller.1994@gmx.de>");
 MODULE_LICENSE("GPL v2");
 
 /*
@@ -45,6 +46,7 @@ MODULE_LICENSE("GPL v2");
 #define PRODUCT_STRING_ID	2
 
 #define INTCLOCK 1
+#define URB_PACKS 8
 
 static int index[SNDRV_CARDS] = SNDRV_DEFAULT_IDX;
 static char *id[SNDRV_CARDS] = SNDRV_DEFAULT_STR;
@@ -114,6 +116,7 @@ struct motu_avb_urb {
 	struct motu_avb * motu;
 	unsigned int packets;
 	unsigned int buffer_size;
+	unsigned int packet_size[8];
 	//struct usb_iso_packet_descriptor iso_frame_desc[1];
 	struct list_head ready_list;
 };
@@ -127,7 +130,7 @@ struct motu_avb {
 	struct list_head midi_list;
 	u64 format_bit;
 	unsigned int rate;
-        bool samplerate_is_set;
+    bool samplerate_is_set;
 	unsigned int packets_per_second;
 	spinlock_t lock;
 	struct mutex mutex;
@@ -136,7 +139,7 @@ struct motu_avb {
 	/* FIFO to synchronize playback rate to capture rate */
 	unsigned int rate_feedback_start;
 	unsigned int rate_feedback_count;
-	u8 rate_feedback[MAX_QUEUE_LENGTH];
+	//u8 rate_feedback[DEFAULT_QUEUE_LENGTH * 8];
 
 	struct list_head ready_playback_urbs;
 	wait_queue_head_t alsa_capture_wait;
@@ -152,12 +155,12 @@ struct motu_avb {
 		unsigned int buffer_pos;
 		unsigned int queue_length;
 		struct motu_avb_urb urbs[DEFAULT_QUEUE_LENGTH];
-		/*struct {
-			unsigned int size;
-			void *addr;
-			dma_addr_t dma;
-		} buffers[MAX_MEMORY_BUFFERS];*/
 	} capture, playback;
+	
+	struct packet_info {
+		unsigned int packet_size[URB_PACKS];
+		unsigned int packets;
+	} next_packet[DEFAULT_QUEUE_LENGTH];
 	
 	unsigned int next_playback_frame;
 };
@@ -168,6 +171,16 @@ static struct usb_driver motu_avb_driver;
 
 static void abort_alsa_playback(struct motu_avb *motu);
 static void abort_alsa_capture(struct motu_avb *motu);
+
+static inline void add_with_wraparound(struct motu_avb *motu,
+				       unsigned int *value, unsigned int add)
+{
+	*value += add;
+	if (*value == motu->playback.queue_length)
+		*value = 0;
+	else if (*value > motu->playback.queue_length)
+		*value -= motu->playback.queue_length;
+}
 
 static void set_samplerate(struct motu_avb *motu)
 {
@@ -268,54 +281,103 @@ static void abort_usb_playback(struct motu_avb *motu)
 }
 
 /* copy data from the ALSA ring buffer into the URB buffer */
-static bool copy_playback_data(struct motu_avb_stream *stream, struct urb *urb,
-			       unsigned int frames)
+static int copy_playback_data(struct motu_avb_stream *stream, struct urb *urb,
+			       unsigned int frames, bool running)
 {
 	struct snd_pcm_runtime *runtime;
-	unsigned int frame_bytes, frames1;
+	struct snd_pcm_substream *subs;
+	struct motu_avb_urb * ctx;
+	struct packet_info * cur_packet;
+	
+	unsigned int frame_bytes, frames1, i, cur_frames, counts = 0, avail = 0, buffer_pos, period_pos;
 	const u8 *source;
+	unsigned int hwptr;
+	bool period_elapsed = false, buffer_overflow = false;
+	
+	ctx = (struct motu_avb_urb *)urb->context;
 
+	subs = stream->substream;
 	runtime = stream->substream->runtime;
 	frame_bytes = stream->frame_bytes;
-	source = runtime->dma_area + stream->buffer_pos * frame_bytes;
-	if (stream->buffer_pos + frames <= runtime->buffer_size) {
-		memcpy(urb->transfer_buffer, source, frames * frame_bytes);
-	} else {
-		/* wrap around at end of ring buffer */
-		frames1 = runtime->buffer_size - stream->buffer_pos;
-		memcpy(urb->transfer_buffer, source, frames1 * frame_bytes);
-		memcpy(urb->transfer_buffer + frames1 * frame_bytes,
-		       runtime->dma_area, (frames - frames1) * frame_bytes);
-	}
+	hwptr = stream->buffer_pos / frame_bytes;
 
-	stream->buffer_pos += frames;
-	if (stream->buffer_pos >= runtime->buffer_size)
-		stream->buffer_pos -= runtime->buffer_size;
-	stream->period_pos += frames;
-	if (stream->period_pos >= runtime->period_size) {
-		stream->period_pos -= runtime->period_size;
-		return true;
+	if (running) {
+		/* calculate the byte offset-in-buffer of the appl_ptr */
+		avail = (runtime->control->appl_ptr - runtime->hw_ptr_base)
+			% runtime->buffer_size;
+		if (avail <= hwptr)
+			avail += runtime->buffer_size;
+		avail -= hwptr;
 	}
-	return false;
-}
+	
+	cur_packet = &ctx->motu->next_packet[ctx->motu->rate_feedback_start];
+	add_with_wraparound(ctx->motu, &ctx->motu->rate_feedback_start, 1);
+	
+	ctx->packets = cur_packet->packets;
+	
+	buffer_pos = stream->buffer_pos;
+	period_pos = stream->period_pos;
+	
 
-static inline void add_with_wraparound(struct motu_avb *motu,
-				       unsigned int *value, unsigned int add)
-{
-	*value += add;
-	if (*value >= motu->playback.queue_length)
-		*value -= motu->playback.queue_length;
+	for (i = 0; i < cur_packet->packets; i++) {
+		cur_frames = cur_packet->packet_size[i];
+		ctx->packet_size[i] = cur_frames;
+		urb->iso_frame_desc[i].length = cur_frames * frame_bytes;
+		urb->iso_frame_desc[i].offset = counts * frame_bytes;
+		if (running) {
+			source = runtime->dma_area + buffer_pos * frame_bytes;
+			if (buffer_pos + cur_frames <= runtime->buffer_size) {
+				memcpy(urb->transfer_buffer + counts * frame_bytes, source, cur_frames * frame_bytes);
+			} else {
+				/* wrap around at end of ring buffer */
+				frames1 = runtime->buffer_size - buffer_pos;
+				memcpy(urb->transfer_buffer + counts * frame_bytes, source, frames1 * frame_bytes);
+				memcpy(urb->transfer_buffer + counts * frame_bytes + frames1 * frame_bytes,
+					   runtime->dma_area, (cur_frames - frames1) * frame_bytes);
+			}
+
+			buffer_pos += cur_frames;
+			if (buffer_pos >= runtime->buffer_size) {
+				buffer_pos -= runtime->buffer_size;
+				buffer_overflow = true;
+			}
+			period_pos += cur_frames;
+			if (period_pos >= runtime->period_size) {
+				period_pos -= runtime->period_size;
+				if (period_elapsed)
+					printk(KERN_WARNING "More than one period used\n");
+				period_elapsed = true;
+			}
+		} else {
+			memset(urb->transfer_buffer + counts * frame_bytes, 0,
+			       urb->iso_frame_desc[i].length);
+		}
+		counts += cur_frames;
+	}
+	if (counts > avail) {
+		printk(KERN_WARNING "Not enough bytes avail %u needed %u\n", avail, counts * frame_bytes);
+		return -1;
+	}
+	stream->buffer_pos = buffer_pos;
+	stream->period_pos = period_pos;
+	if (period_elapsed)
+		return 1;
+	return 0;
 }
 
 static void playback_tasklet(struct motu_avb *data)
 {
 	//struct motu_avb *motu = (void *)data;
 	struct motu_avb *motu = data;
+	struct motu_avb_urb *ctx;
 	unsigned long flags;
-	unsigned int frames;
+	unsigned int frames = 0;
 	struct motu_avb_urb *urb;
 	bool do_period_elapsed = false;
-	int err;
+	int copy_status;
+	int err, i;
+	
+	
 
 	if (unlikely(!test_bit(USB_PLAYBACK_RUNNING, &motu->states)))
 		return;
@@ -334,10 +396,6 @@ static void playback_tasklet(struct motu_avb *data)
 	spin_lock_irqsave(&motu->lock, flags);
 	while (motu->rate_feedback_count > 0 &&
 	       !list_empty(&motu->ready_playback_urbs)) {
-		/* take packet size out of FIFO */
-		frames = motu->rate_feedback[motu->rate_feedback_start];
-		add_with_wraparound(motu, &motu->rate_feedback_start, 1);
-		motu->rate_feedback_count--;
 
 		/* take URB out of FIFO */
 		urb = list_first_entry(&motu->ready_playback_urbs,
@@ -345,16 +403,17 @@ static void playback_tasklet(struct motu_avb *data)
 		list_del(&urb->ready_list);
 
 		/* fill packet with data or silence */
-		urb->urb->iso_frame_desc[0].length =
-			frames * motu->playback.frame_bytes;
-		if (test_bit(ALSA_PLAYBACK_RUNNING, &motu->states))
-			do_period_elapsed |= copy_playback_data(&motu->playback,
-								urb->urb,
-								frames);
-		else
-			memset(urb->urb->transfer_buffer, 0,
-			       urb->urb->iso_frame_desc[0].length);
-
+		copy_status = copy_playback_data(&motu->playback,
+							urb->urb,
+							frames,
+							test_bit(ALSA_PLAYBACK_RUNNING, &motu->states));
+		if (copy_status > 0)
+			do_period_elapsed = true;
+		else if (copy_status < 0)
+			break;
+		for (i = 0; i < urb->packets; i++)
+			frames += urb->packet_size[i];
+		motu->rate_feedback_count--;
 		/* and off you go ... */
 		err = usb_submit_urb(urb->urb, GFP_ATOMIC);
 		if (unlikely(err < 0)) {
@@ -368,8 +427,9 @@ static void playback_tasklet(struct motu_avb *data)
 		motu->playback.substream->runtime->delay += frames;
 	}
 	spin_unlock_irqrestore(&motu->lock, flags);
-	if (do_period_elapsed)
+	if (do_period_elapsed) {
 		snd_pcm_period_elapsed(motu->playback.substream);
+	}
 }
 
 static void playback_urb_complete(struct urb *urb)
@@ -377,6 +437,7 @@ static void playback_urb_complete(struct urb *urb)
 	//struct motu_avb_urb *urb = (struct motu_avb_urb *)usb_urb;
 	struct motu_avb *motu = ((struct motu_avb_urb *)urb->context)->motu;
 	unsigned long flags;
+	unsigned int frames = 0, i;
 
 	if (unlikely(urb->status == -ENOENT ||	/* unlinked */
 		     urb->status == -ENODEV ||	/* device removed */
@@ -396,9 +457,9 @@ static void playback_urb_complete(struct urb *urb)
 		/* append URB to FIFO */
 		spin_lock_irqsave(&motu->lock, flags);
 		list_add_tail(&((struct motu_avb_urb *)urb->context)->ready_list, &motu->ready_playback_urbs);
-		motu->playback.substream->runtime->delay -=
-				urb->iso_frame_desc[0].length /
-						motu->playback.frame_bytes;
+		for (i = 0; i < urb->number_of_packets; i++)
+			frames += urb->iso_frame_desc[i].length;
+		motu->playback.substream->runtime->delay -= frames / motu->playback.frame_bytes;
 		spin_unlock_irqrestore(&motu->lock, flags);
 		if (motu->rate_feedback_count > 0)
 			playback_tasklet(motu);
@@ -423,42 +484,47 @@ static bool copy_capture_data(struct motu_avb_stream *stream, struct urb *urb,
 			      unsigned int frames)
 {
 	struct snd_pcm_runtime *runtime;
-	unsigned int frame_bytes, frames1;
+	unsigned int frame_bytes, frames1, i, cur_frames;
 	u8 *dest;
+	bool do_period_elapsed = false;
 
 	runtime = stream->substream->runtime;
 	frame_bytes = stream->frame_bytes;
-	dest = runtime->dma_area + stream->buffer_pos * frame_bytes;
-	if (stream->buffer_pos + frames <= runtime->buffer_size) {
-		memcpy(dest, urb->transfer_buffer, frames * frame_bytes);
-	} else {
-		/* wrap around at end of ring buffer */
-		frames1 = runtime->buffer_size - stream->buffer_pos;
-		memcpy(dest, urb->transfer_buffer, frames1 * frame_bytes);
-		memcpy(runtime->dma_area,
-		       urb->transfer_buffer + frames1 * frame_bytes,
-		       (frames - frames1) * frame_bytes);
+	for (i = 0; i < urb->number_of_packets; i++) {
+		dest = runtime->dma_area + stream->buffer_pos * frame_bytes;
+		cur_frames = urb->iso_frame_desc[i].actual_length / frame_bytes;
+		if (stream->buffer_pos + cur_frames <= runtime->buffer_size) {
+			memcpy(dest, urb->transfer_buffer + urb->iso_frame_desc[i].offset, cur_frames * frame_bytes);
+		} else {
+			/* wrap around at end of ring buffer */
+			frames1 = runtime->buffer_size - stream->buffer_pos;
+			memcpy(dest, urb->transfer_buffer + urb->iso_frame_desc[i].offset, frames1 * frame_bytes);
+			memcpy(runtime->dma_area,
+				   urb->transfer_buffer + urb->iso_frame_desc[i].offset + frames1 * frame_bytes,
+				   (cur_frames - frames1) * frame_bytes);
+		}
+		stream->buffer_pos += cur_frames;
+		if (stream->buffer_pos >= runtime->buffer_size)
+			stream->buffer_pos -= runtime->buffer_size;
+		stream->period_pos += cur_frames;
+		if (stream->period_pos >= runtime->period_size) {
+			stream->period_pos -= runtime->period_size;
+			do_period_elapsed = true;
+		}
 	}
-
-	stream->buffer_pos += frames;
-	if (stream->buffer_pos >= runtime->buffer_size)
-		stream->buffer_pos -= runtime->buffer_size;
-	stream->period_pos += frames;
-	if (stream->period_pos >= runtime->period_size) {
-		stream->period_pos -= runtime->period_size;
-		return true;
-	}
-	return false;
+	return do_period_elapsed;
 }
 
 static void capture_urb_complete(struct urb *urb)
 {
 	struct motu_avb *motu = ((struct motu_avb_urb *)urb->context)->motu;
 	struct motu_avb_stream *stream = &motu->capture;
+	struct packet_info * out_packet;
+	//struct motu_avb_stream *playback_stream = &motu->playback;
 	unsigned long flags;
 	unsigned int frames, write_ptr;
-	bool do_period_elapsed;
-	int err;
+	bool do_period_elapsed = false;
+	int err, i;
 
 	if (unlikely(urb->status == -ENOENT ||		/* unlinked */
 		     urb->status == -ENODEV ||		/* device removed */
@@ -466,11 +532,13 @@ static void capture_urb_complete(struct urb *urb)
 		     urb->status == -ESHUTDOWN))	/* device disabled */
 		goto stream_stopped;
 
-	if (urb->status >= 0 && urb->iso_frame_desc[0].status >= 0)
-		frames = urb->iso_frame_desc[0].actual_length /
-			stream->frame_bytes;
-	else
-		frames = 0;
+	frames = 0;
+	for(i = 0; i < urb->number_of_packets; i++) {
+		if (urb->status >= 0 && urb->iso_frame_desc[i].status >= 0) {
+			frames += urb->iso_frame_desc[i].actual_length /
+				stream->frame_bytes;
+		}
+	}
 
 	spin_lock_irqsave(&motu->lock, flags);
 
@@ -480,6 +548,18 @@ static void capture_urb_complete(struct urb *urb)
 		do_period_elapsed = false;
 
 	if (test_bit(USB_CAPTURE_RUNNING, &motu->states)) {
+		/* append packet size to FIFO */
+		write_ptr = motu->rate_feedback_start;
+		add_with_wraparound(motu, &write_ptr, motu->rate_feedback_count);
+		out_packet = &motu->next_packet[write_ptr];
+		out_packet->packets = urb->number_of_packets;
+		for (i = 0; i< urb->number_of_packets; i++) {
+			if (urb->iso_frame_desc[i].status == 0) 
+				out_packet->packet_size[i] = urb->iso_frame_desc[i].actual_length / stream->frame_bytes;
+			else
+				out_packet->packet_size[i] = 0;	
+		}
+
 		err = usb_submit_urb(urb, GFP_ATOMIC);
 		if (unlikely(err < 0)) {
 			spin_unlock_irqrestore(&motu->lock, flags);
@@ -488,10 +568,6 @@ static void capture_urb_complete(struct urb *urb)
 			goto stream_stopped;
 		}
 
-		/* append packet size to FIFO */
-		write_ptr = motu->rate_feedback_start;
-		add_with_wraparound(motu, &write_ptr, motu->rate_feedback_count);
-		motu->rate_feedback[write_ptr] = frames;
 		if (motu->rate_feedback_count < motu->playback.queue_length) {
 			motu->rate_feedback_count++;
 			if (motu->rate_feedback_count ==
@@ -534,6 +610,7 @@ static void first_capture_urb_complete(struct urb *urb)
 
 	set_bit(CAPTURE_URB_COMPLETED, &motu->states);
 	wake_up(&motu->alsa_capture_wait);
+	wake_up(&motu->alsa_playback_wait);
 }
 
 static int submit_stream_urbs(struct motu_avb *motu, struct motu_avb_stream *stream)
@@ -672,7 +749,7 @@ static void stop_usb_playback(struct motu_avb *motu)
 static int start_usb_playback(struct motu_avb *motu)
 {
 	printk(KERN_WARNING "Start playback called\n");
-	unsigned int i, frames; // i, 
+	unsigned int i, frames, frame_offset, isoc_no; // i, 
 	struct urb *urb;
 	int err = 0;
 
@@ -721,7 +798,7 @@ static int start_usb_playback(struct motu_avb *motu)
 	 * packet size FIFO to be full.
 	 */
 	wait_event(motu->rate_feedback_wait,
-		   motu->rate_feedback_count >= motu->playback.queue_length ||
+		   motu->rate_feedback_count >= 0 || //motu->playback.queue_length
 		   !test_bit(USB_CAPTURE_RUNNING, &motu->states) ||
 		   test_bit(DISCONNECTED, &motu->states));
 	if (test_bit(DISCONNECTED, &motu->states)) {
@@ -733,63 +810,78 @@ static int start_usb_playback(struct motu_avb *motu)
 		return -EIO;
 	}
 
-        // the very first urb must have the maximum number of frames 
+    // the very first urb must have the maximum number of frames 
 
-        spin_lock_irq(&motu->lock);
-       
-        switch (motu->rate)
-        {
-        case 44100:
-           frames = 6;
-           break;
-        case 48000:
-           frames = 7;
-           break;
-        case 88200:
-           frames = 12;
-           break;
-        case 96000:
-           frames = 13;
-           break;
-        case 172400:
-           frames = 24;
-           break;
-        case 192000:
-           frames = 25;
-           break;
-        }
+    spin_lock_irq(&motu->lock);
+   
+    switch (motu->rate)
+    {
+    case 44100:
+       frames = 6;
+       break;
+    case 48000:
+       frames = 7;
+       break;
+    case 88200:
+       frames = 12;
+       break;
+    case 96000:
+       frames = 13;
+       break;
+    case 172400:
+       frames = 24;
+       break;
+    case 192000:
+       frames = 25;
+       break;
+    }
 
-        motu->rate_feedback_count--;
+    //motu->rate_feedback_count--;
+
+	for (i = 0; i < motu->playback.queue_length; i++) {
+		list_add_tail(&motu->playback.urbs[i].ready_list, &motu->ready_playback_urbs);
+	}
 
 	spin_unlock_irq(&motu->lock);
+	set_bit(USB_PLAYBACK_RUNNING, &motu->states);
+	wake_up(&motu->alsa_playback_wait);
 
+	/*
 	urb = motu->playback.urbs[0].urb;
-	urb->iso_frame_desc[0].length =
-		frames * motu->playback.frame_bytes;
-	memset(urb->transfer_buffer, 0,
-	       urb->iso_frame_desc[0].length);
+	for (isoc_no = 0; isoc_no<URB_PACKS; isoc_no++) {
+		urb->iso_frame_desc[isoc_no].length =
+			frames * motu->playback.frame_bytes;
+		urb->iso_frame_desc[isoc_no].offset = isoc_no * frames * motu->playback.frame_bytes;
+		memset(urb->transfer_buffer + urb->iso_frame_desc[isoc_no].offset, 0,
+			   urb->iso_frame_desc[isoc_no].length);
+	}
 
 	for (i = 1; i < motu->playback.queue_length; ++i) {
-		printk(KERN_WARNING "Init urb %u\n", i);
+		struct packet_info * cur_packet;
 		// all initial URBs contain silence
 		spin_lock_irq(&motu->lock);
-		frames = motu->rate_feedback[motu->rate_feedback_start];
+		//frames = motu->rate_feedback[motu->rate_feedback_start];
+		cur_packet = &motu->next_packet[i];
 		add_with_wraparound(motu, &motu->rate_feedback_start, 1);
 		motu->rate_feedback_count--;
 		spin_unlock_irq(&motu->lock);
 		urb = motu->playback.urbs[i].urb;
-		urb->iso_frame_desc[0].length =
-			frames * motu->playback.frame_bytes;
-		memset(urb->transfer_buffer, 0,
-		       urb->iso_frame_desc[0].length);
-		printk(KERN_WARNING "urb length %u\n", urb->iso_frame_desc[0].length);
+		for (isoc_no = 0; isoc_no<URB_PACKS; isoc_no++) {
+			frames = cur_packet->packet_size[isoc_no];
+			urb->iso_frame_desc[isoc_no].length =
+				frames * motu->playback.frame_bytes;
+			urb->iso_frame_desc[isoc_no].offset = isoc_no * frames * motu->playback.frame_bytes;
+			memset(urb->transfer_buffer + urb->iso_frame_desc[isoc_no].offset, 0,
+				   urb->iso_frame_desc[isoc_no].length);
+		}
 	}
 
 	set_bit(USB_PLAYBACK_RUNNING, &motu->states);
 	err = submit_stream_urbs(motu, &motu->playback);
 	if (err < 0)
 		stop_usb_playback(motu);
-	return err;
+	return err;*/
+	return 0;
 }
 
 static void abort_alsa_capture(struct motu_avb *motu)
@@ -991,9 +1083,12 @@ static int playback_pcm_prepare(struct snd_pcm_substream *substream)
 		return err;
 
 	/* see the comment in capture_pcm_prepare() */
+	/*wait_event(motu->alsa_playback_wait,
+		   test_bit(CAPTURE_URB_COMPLETED, &motu->states) ||
+		   !test_bit(USB_PLAYBACK_RUNNING, &motu->states));*/
 	wait_event(motu->alsa_playback_wait,
-		   test_bit(PLAYBACK_URB_COMPLETED, &motu->states) ||
-		   !test_bit(USB_PLAYBACK_RUNNING, &motu->states));
+	   test_bit(CAPTURE_URB_COMPLETED, &motu->states) ||
+	   !test_bit(USB_PLAYBACK_RUNNING, &motu->states));
 	if (test_bit(DISCONNECTED, &motu->states))
 		return -ENODEV;
 	if (!test_bit(USB_PLAYBACK_RUNNING, &motu->states))
@@ -1162,16 +1257,16 @@ static int alloc_stream_urbs(struct motu_avb *motu, struct motu_avb_stream *stre
 {
 	unsigned max_packet_size = stream->max_packet_bytes;
 	struct motu_avb_urb *urb_ctx;
-	unsigned int urb_no, urb_packs; // b, u = 0, 
+	unsigned int urb_no, urb_packs, isoc_no; // b, u = 0, 
 	
 	stream->queue_length = queue_length;
-	urb_packs = 1;
+	urb_packs = URB_PACKS;
 	
 	for (urb_no = 0; urb_no < stream->queue_length; urb_no++) {
 		urb_ctx = &stream->urbs[urb_no];
 		urb_ctx->motu = motu;
 		urb_ctx->packets = urb_packs;
-		urb_ctx->buffer_size = max_packet_size * urb_ctx->packets;
+		urb_ctx->buffer_size = max_packet_size * urb_packs;
 		
 		urb_ctx->urb = usb_alloc_urb(urb_ctx->packets, GFP_KERNEL);
 		if (!urb_ctx->urb)
@@ -1185,12 +1280,14 @@ static int alloc_stream_urbs(struct motu_avb *motu, struct motu_avb_stream *stre
 		urb_ctx->urb->pipe = stream->usb_pipe;
 		urb_ctx->urb->transfer_flags = URB_NO_TRANSFER_DMA_MAP;
 		urb_ctx->urb->interval = 1;
-		urb_ctx->urb->transfer_buffer_length = max_packet_size;
-		urb_ctx->urb->number_of_packets = 1;
+		urb_ctx->urb->transfer_buffer_length = urb_packs * max_packet_size;
+		urb_ctx->urb->number_of_packets = urb_packs;
 		urb_ctx->urb->context = urb_ctx;
 		urb_ctx->urb->complete = urb_complete;
-		urb_ctx->urb->iso_frame_desc[0].offset = 0;
-		urb_ctx->urb->iso_frame_desc[0].length = max_packet_size;
+		for (isoc_no = 0; isoc_no < urb_packs; isoc_no++) {
+			urb_ctx->urb->iso_frame_desc[isoc_no].offset = isoc_no*max_packet_size;
+			urb_ctx->urb->iso_frame_desc[isoc_no].length = max_packet_size;
+		}
 	}
 
 	return 0;
