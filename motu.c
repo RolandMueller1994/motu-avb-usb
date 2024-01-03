@@ -941,6 +941,9 @@ static int alloc_stream_urbs(struct motu_avb *motu, struct motu_avb_stream *stre
 	unsigned int freqmax = motu->rate + (motu->rate >> 1);
 	unsigned int maxsize = DIV_ROUND_UP(freqmax, 8000);
 	
+	if (maxsize > max_packet_size / stream->frame_bytes) 
+		maxsize = max_packet_size / stream->frame_bytes;
+	
 	stream->queue_length = queue_length;
 	printk(KERN_WARNING "Period size %u\n", period_size);
 	printk(KERN_WARNING "Period bytes %u\n", period_bytes);
