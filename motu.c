@@ -604,6 +604,8 @@ stream_stopped:
 static void first_capture_urb_complete(struct urb *urb)
 {
 	struct motu_avb *motu = ((struct motu_avb_urb *)urb->context)->motu;
+	
+	printk(KERN_WARNING "first capture urb\n");
 
 	urb->complete = capture_urb_complete;
 	capture_urb_complete(urb);
@@ -885,12 +887,7 @@ static int capture_pcm_open(struct snd_pcm_substream *substream)
 		DIV_ROUND_CLOSEST(motu->rate, motu->packets_per_second);
 	substream->runtime->delay = substream->runtime->hw.fifo_size;
 
-	mutex_lock(&motu->mutex);
-	err = start_usb_capture(motu);
-	if (err >= 0)
-		set_bit(ALSA_CAPTURE_OPEN, &motu->states);
-	mutex_unlock(&motu->mutex);
-	return err;
+	return 0;
 }
 
 static int playback_pcm_open(struct snd_pcm_substream *substream)
@@ -910,20 +907,8 @@ static int playback_pcm_open(struct snd_pcm_substream *substream)
 		DIV_ROUND_CLOSEST(motu->rate * motu->playback.queue_length,
 				  motu->packets_per_second);
 
-	mutex_lock(&motu->mutex);
-	err = start_usb_capture(motu);
-	if (err < 0)
-		goto error;
-	err = start_usb_playback(motu);
-	if (err < 0) {
-		if (!test_bit(ALSA_CAPTURE_OPEN, &motu->states))
-			stop_usb_capture(motu);
-		goto error;
-	}
-	set_bit(ALSA_PLAYBACK_OPEN, &motu->states);
-error:
 	mutex_unlock(&motu->mutex);
-	return err;
+	return 0;
 }
 
 static int capture_pcm_close(struct snd_pcm_substream *substream)
@@ -1002,9 +987,9 @@ static int capture_pcm_hw_params(struct snd_pcm_substream *substream,
 	
 	printk(KERN_WARNING "capture_hw_params\n");
 
-	mutex_lock(&motu->mutex);
+	/*mutex_lock(&motu->mutex);
 	err = start_usb_capture(motu);
-	mutex_unlock(&motu->mutex);
+	mutex_unlock(&motu->mutex);*/
 	return err;
 }
 
@@ -1016,10 +1001,10 @@ static int playback_pcm_hw_params(struct snd_pcm_substream *substream,
 	
 	printk(KERN_WARNING "playback_pcm_hw_params\n");
 
-	mutex_lock(&motu->mutex);
+	/*mutex_lock(&motu->mutex);
 	if (err >= 0)
 		err = start_usb_playback(motu);
-	mutex_unlock(&motu->mutex);
+	mutex_unlock(&motu->mutex);*/
 	return err;
 }
 
@@ -1028,14 +1013,29 @@ static int capture_pcm_prepare(struct snd_pcm_substream *substream)
 	struct motu_avb *motu = substream->private_data;
 	int err;
 	
+	mutex_lock(&motu->mutex);
+	if (test_bit(ALSA_CAPTURE_OPEN, &motu->states)) {
+		mutex_unlock(&motu->mutex);
+		return 0;
+	}
+	
 	printk(KERN_WARNING "capture_pcm_prepare\n");
 
-	mutex_lock(&motu->mutex);
+	/*mutex_lock(&motu->mutex);
 	err = start_usb_capture(motu);
 	mutex_unlock(&motu->mutex);
 	if (err < 0)
+		return err;*/
+		
+	
+	err = start_usb_capture(motu);
+	if (err >= 0)
+		set_bit(ALSA_CAPTURE_OPEN, &motu->states);
+	mutex_unlock(&motu->mutex);
+	if (err < 0)
 		return err;
-
+		
+	printk(KERN_WARNING "capture started\n");
 	/*
 	 * The EHCI driver schedules the first packet of an iso stream at 10 ms
 	 * in the future, i.e., no data is actually captured for that long.
@@ -1060,15 +1060,34 @@ static int playback_pcm_prepare(struct snd_pcm_substream *substream)
 	struct motu_avb *motu = substream->private_data;
 	int err; 
 	
+	mutex_lock(&motu->mutex);
+	if (test_bit(ALSA_PLAYBACK_OPEN, &motu->states)) {
+		mutex_unlock(&motu->mutex);
+		return 0;
+	}
+	
 	printk(KERN_WARNING "playback_pcm_prepare\n");
 
-	mutex_lock(&motu->mutex);
-	err = start_usb_capture(motu);
-	if (err >= 0)
-		err = start_usb_playback(motu);		
+	
+	/*err = start_usb_capture(motu);
+	if (err >= 0)*/
+	err = start_usb_playback(motu);
 	mutex_unlock(&motu->mutex);
 	if (err < 0)
 		return err;
+	printk(KERN_WARNING "playback started\n");
+		
+	/*mutex_lock(&motu->mutex);
+	err = start_usb_capture(motu);
+	if (err < 0)
+		goto error;
+	err = start_usb_playback(motu);
+	if (err < 0) {
+		if (!test_bit(ALSA_CAPTURE_OPEN, &motu->states))
+			stop_usb_capture(motu);
+		goto error;
+	}*/
+	set_bit(ALSA_PLAYBACK_OPEN, &motu->states);
 
 	/* see the comment in capture_pcm_prepare() */
 	/*wait_event(motu->alsa_playback_wait,
