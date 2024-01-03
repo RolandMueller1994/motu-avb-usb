@@ -795,12 +795,8 @@ static int start_usb_playback(struct motu_avb *motu)
 	if (err < 0)
 		return err;
 
-	/*
-	 * We submit the initial URBs all at once, so we have to wait for the
-	 * packet size FIFO to be full.
-	 */
 	wait_event(motu->rate_feedback_wait,
-		   motu->rate_feedback_count >= 0 ||
+		   motu->rate_feedback_count >= 2 ||
 		   !test_bit(USB_CAPTURE_RUNNING, &motu->states) ||
 		   test_bit(DISCONNECTED, &motu->states));
 	if (test_bit(DISCONNECTED, &motu->states)) {
@@ -935,16 +931,25 @@ static int playback_pcm_close(struct snd_pcm_substream *substream)
 }
 
 static int alloc_stream_urbs(struct motu_avb *motu, struct motu_avb_stream *stream,
-			     void (*urb_complete)(struct urb *))
+			     void (*urb_complete)(struct urb *), struct snd_pcm_hw_params *params)
 {
 	unsigned max_packet_size = stream->max_packet_bytes;
 	struct motu_avb_urb *urb_ctx;
 	unsigned int urb_no, urb_packs, isoc_no; // b, u = 0, 
-	//unsigned int period_size = params_period_size(params);
+	unsigned int period_size = params_period_size(params);
+	unsigned int period_bytes = period_size * stream->frame_bytes;
+	unsigned int freqmax = motu->rate + (motu->rate >> 1);
+	unsigned int maxsize = DIV_ROUND_UP(freqmax, 8000);
 	
 	stream->queue_length = queue_length;
-	//printk(KERN_WARNING "Period size %u\n", period_size);
+	printk(KERN_WARNING "Period size %u\n", period_size);
+	printk(KERN_WARNING "Period bytes %u\n", period_bytes);
+	printk(KERN_WARNING "Maxsize %u\n", maxsize);
 	urb_packs = URB_PACKS;
+	
+	while (urb_packs > 1 && urb_packs * maxsize >= period_size)
+		urb_packs >>= 1;
+	printk(KERN_WARNING "urb packs %u\n", urb_packs);
 	
 	for (urb_no = 0; urb_no < stream->queue_length; urb_no++) {
 		urb_ctx = &stream->urbs[urb_no];
@@ -984,7 +989,7 @@ static int capture_pcm_hw_params(struct snd_pcm_substream *substream,
 	int err = 0;
 	
 	mutex_lock(&motu->mutex);
-	err = alloc_stream_urbs(motu, &motu->capture, capture_urb_complete);
+	err = alloc_stream_urbs(motu, &motu->capture, capture_urb_complete, hw_params);
 	if (err < 0)
 		goto probe_error;
 	
@@ -1001,7 +1006,7 @@ static int playback_pcm_hw_params(struct snd_pcm_substream *substream,
 	int err = 0;
 	
 	mutex_lock(&motu->mutex);
-	err = alloc_stream_urbs(motu, &motu->playback, playback_urb_complete);
+	err = alloc_stream_urbs(motu, &motu->playback, playback_urb_complete, hw_params);
 	if (err < 0)
 		goto probe_error;
 	
@@ -1399,13 +1404,6 @@ static int motu_avb_probe(struct usb_interface *interface,
 	usb_make_path(motu->dev, usb_path, sizeof(usb_path));
 	snprintf(motu->card->longname, sizeof(motu->card->longname),
 		 "MOTU %s", motu->dev->product);
-
-	/*err = alloc_stream_urbs(motu, &motu->capture, capture_urb_complete);
-	if (err < 0)
-		goto probe_error;
-	err = alloc_stream_urbs(motu, &motu->playback, playback_urb_complete);
-	if (err < 0)
-		goto probe_error;*/
 
 	err = snd_pcm_new(card, name, 0, 1, 1, &motu->pcm);
 	if (err < 0)
