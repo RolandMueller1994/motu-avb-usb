@@ -906,8 +906,6 @@ static int playback_pcm_open(struct snd_pcm_substream *substream)
 	substream->runtime->hw.fifo_size =
 		DIV_ROUND_CLOSEST(motu->rate * motu->playback.queue_length,
 				  motu->packets_per_second);
-
-	mutex_unlock(&motu->mutex);
 	return 0;
 }
 
@@ -985,11 +983,14 @@ static int capture_pcm_hw_params(struct snd_pcm_substream *substream,
 	struct motu_avb *motu = substream->private_data;
 	int err = 0;
 	
+	mutex_lock(&motu->mutex);
+	err = alloc_stream_urbs(motu, &motu->capture, capture_urb_complete);
+	if (err < 0)
+		goto probe_error;
+	
 	printk(KERN_WARNING "capture_hw_params\n");
-
-	/*mutex_lock(&motu->mutex);
-	err = start_usb_capture(motu);
-	mutex_unlock(&motu->mutex);*/
+probe_error:
+	mutex_unlock(&motu->mutex);
 	return err;
 }
 
@@ -999,12 +1000,14 @@ static int playback_pcm_hw_params(struct snd_pcm_substream *substream,
 	struct motu_avb *motu = substream->private_data;
 	int err = 0;
 	
+	mutex_lock(&motu->mutex);
+	err = alloc_stream_urbs(motu, &motu->playback, playback_urb_complete);
+	if (err < 0)
+		goto probe_error;
+	
 	printk(KERN_WARNING "playback_pcm_hw_params\n");
-
-	/*mutex_lock(&motu->mutex);
-	if (err >= 0)
-		err = start_usb_playback(motu);
-	mutex_unlock(&motu->mutex);*/
+probe_error:
+	mutex_unlock(&motu->mutex);
 	return err;
 }
 
@@ -1020,13 +1023,6 @@ static int capture_pcm_prepare(struct snd_pcm_substream *substream)
 	}
 	
 	printk(KERN_WARNING "capture_pcm_prepare\n");
-
-	/*mutex_lock(&motu->mutex);
-	err = start_usb_capture(motu);
-	mutex_unlock(&motu->mutex);
-	if (err < 0)
-		return err;*/
-		
 	
 	err = start_usb_capture(motu);
 	if (err >= 0)
@@ -1068,31 +1064,14 @@ static int playback_pcm_prepare(struct snd_pcm_substream *substream)
 	
 	printk(KERN_WARNING "playback_pcm_prepare\n");
 
-	
-	/*err = start_usb_capture(motu);
-	if (err >= 0)*/
 	err = start_usb_playback(motu);
 	mutex_unlock(&motu->mutex);
 	if (err < 0)
 		return err;
 	printk(KERN_WARNING "playback started\n");
 		
-	/*mutex_lock(&motu->mutex);
-	err = start_usb_capture(motu);
-	if (err < 0)
-		goto error;
-	err = start_usb_playback(motu);
-	if (err < 0) {
-		if (!test_bit(ALSA_CAPTURE_OPEN, &motu->states))
-			stop_usb_capture(motu);
-		goto error;
-	}*/
 	set_bit(ALSA_PLAYBACK_OPEN, &motu->states);
 
-	/* see the comment in capture_pcm_prepare() */
-	/*wait_event(motu->alsa_playback_wait,
-		   test_bit(CAPTURE_URB_COMPLETED, &motu->states) ||
-		   !test_bit(USB_PLAYBACK_RUNNING, &motu->states));*/
 	wait_event(motu->alsa_playback_wait,
 	   test_bit(CAPTURE_URB_COMPLETED, &motu->states) ||
 	   !test_bit(USB_PLAYBACK_RUNNING, &motu->states));
@@ -1421,12 +1400,12 @@ static int motu_avb_probe(struct usb_interface *interface,
 	snprintf(motu->card->longname, sizeof(motu->card->longname),
 		 "MOTU %s", motu->dev->product);
 
-	err = alloc_stream_urbs(motu, &motu->capture, capture_urb_complete);
+	/*err = alloc_stream_urbs(motu, &motu->capture, capture_urb_complete);
 	if (err < 0)
 		goto probe_error;
 	err = alloc_stream_urbs(motu, &motu->playback, playback_urb_complete);
 	if (err < 0)
-		goto probe_error;
+		goto probe_error;*/
 
 	err = snd_pcm_new(card, name, 0, 1, 1, &motu->pcm);
 	if (err < 0)
