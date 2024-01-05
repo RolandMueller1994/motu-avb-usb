@@ -879,8 +879,8 @@ static int set_stream_hw(struct motu_avb *motu, struct snd_pcm_substream *substr
 									snd_pcm_rate_to_rate_bit(96000) | 
 									snd_pcm_rate_to_rate_bit(176400) | 
 									snd_pcm_rate_to_rate_bit(196000);
-	substream->runtime->hw.rate_min = 96000;
-	substream->runtime->hw.rate_max = 96000;
+	substream->runtime->hw.rate_min = 44100;
+	substream->runtime->hw.rate_max = 196000;
 	substream->runtime->hw.channels_min = min_channels;
 	substream->runtime->hw.channels_max = max_channels;
 	substream->runtime->hw.buffer_bytes_max = 45000 * 1024;
