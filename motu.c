@@ -735,14 +735,14 @@ static int start_usb_capture(struct motu_avb *motu)
 		enable_iso_interface(motu, INTF_CAPTURE);
 	}
 	
-	if (vendor)
+	/*if (vendor)
 	{
 		disable_iso_interface(motu, INTF_VENDOR_OUT);
 	}
 	else
 	{
 		disable_iso_interface(motu, INTF_PLAYBACK);
-	}
+	}*/
 	if (vendor)
 	{
 		enable_iso_interface(motu, INTF_VENDOR_OUT);
@@ -796,6 +796,33 @@ static int start_usb_playback(struct motu_avb *motu)
 	clear_bit(USB_PLAYBACK_RUNNING, &motu->states);
 
 	kill_stream_urbs(&motu->playback);
+
+	if (vendor)
+	{
+		enable_iso_interface(motu, INTF_VENDOR_IN);
+	}
+	else
+	{
+		enable_iso_interface(motu, INTF_CAPTURE);
+	}
+	
+	/*if (vendor)
+	{
+		disable_iso_interface(motu, INTF_VENDOR_OUT);
+	}
+	else
+	{
+		disable_iso_interface(motu, INTF_PLAYBACK);
+	}*/
+	if (vendor)
+	{
+		enable_iso_interface(motu, INTF_VENDOR_OUT);
+	}
+	else
+	{
+		enable_iso_interface(motu, INTF_PLAYBACK);
+	}
+
 
 	if (err < 0)
 		return err;
