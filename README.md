@@ -2,7 +2,6 @@
 Linux USB driver for the MOTU AVB series interfaces
 
 ## Module parameters:
-samplerate: set the samplerate (its currently fixed at module load) default: 44100
 
 midi: set 1 for devices that have a midi port, 0 for the ones that don't
 
@@ -12,10 +11,16 @@ Important: vendor mode requires to patch and recompile the kernel!
 
 it is recommended to set the parameters in the file /etc/modprobe.d/alsa-base.conf, e.g.
 
-	options motu samplerate=44100 midi=1 vendor=0 
+	options motu midi=1 vendor=0 
 
 You may also make linux load the module during boot to prevent the alsa usb audio driver to take control of your device.
 This is done by adding motu to file /etc/modules-load.d/modules.conf
+
+Also, the device can be disabled in the alsa usb audio driver by adding:
+
+	options snd_usb_audio enable=0 vid=0x07fd pid=0x0005 autoclock=no
+
+to /etc/modprobe.d/alsa-base.conf.
 
 ## Preparations
 
