@@ -39,6 +39,7 @@ static bool enable[SNDRV_CARDS] = SNDRV_DEFAULT_ENABLE_PNP;
 static unsigned int queue_length = DEFAULT_QUEUE_LENGTH;
 static bool midi = 0;
 static bool vendor = 0;
+static unsigned int channels = 0;
 
 module_param_array(index, int, NULL, 0444);
 MODULE_PARM_DESC(index, "card index");
@@ -50,6 +51,9 @@ module_param(midi, bool, 0444);
 MODULE_PARM_DESC(midi, "device has midi ports");
 module_param(vendor, bool, 0444);
 MODULE_PARM_DESC(vendor, "vendor");
+
+module_param(channels, uint, 0444);
+MODULE_PARM_DESC(channels, "channels");
 
 enum {
     INTF_AUDIOCONTROL,
@@ -333,6 +337,7 @@ static int copy_playback_data(struct motu_avb_stream *stream, struct urb *urb,
 		This is done such that there are no dropouts in playback stream which might cause
 		channel hopping or decimated sound.
 		*/	
+		counts = 0;
 		for (i = 0; i < cur_packet->packets; i++) {
 			cur_frames = cur_packet->packet_size[i];
 			ctx->packet_size[i] = cur_frames;
@@ -752,8 +757,9 @@ static int start_usb_capture(struct motu_avb *motu)
 	{
 		err = enable_iso_interface(motu, INTF_PLAYBACK);
 	}
-	if (err < 0)
+	if (err < 0) {
 		return err;
+	}
 
 	clear_bit(CAPTURE_URB_COMPLETED, &motu->states);
 	motu->rate_feedback_start = 0;
@@ -818,8 +824,9 @@ static int start_usb_playback(struct motu_avb *motu)
 		err = enable_iso_interface(motu, INTF_PLAYBACK);
 	}
 
-	if (err < 0)
+	if (err < 0) {
 		return err;
+	}
 
 	clear_bit(PLAYBACK_URB_COMPLETED, &motu->states);
 	spin_lock_irq(&motu->lock);
@@ -840,7 +847,6 @@ static int start_usb_playback(struct motu_avb *motu)
 	}
 
 	spin_unlock_irq(&motu->lock);
-
 	wait_event(motu->rate_feedback_wait,
 		   test_bit(CAPTURE_URB_COMPLETED, &motu->states) ||
 		   !test_bit(USB_CAPTURE_RUNNING, &motu->states) ||
@@ -856,7 +862,6 @@ static int start_usb_playback(struct motu_avb *motu)
 
 	set_bit(USB_PLAYBACK_RUNNING, &motu->states);
 	wake_up(&motu->alsa_playback_wait);
-
 	return 0;
 }
 
@@ -878,7 +883,10 @@ static int set_stream_hw(struct motu_avb *motu, struct snd_pcm_substream *substr
 	int err;
 	unsigned int min_channels, max_channels;
 	
-	if (vendor) {
+	if (vendor && channels > 0) {
+		min_channels = channels;
+		max_channels = channels;
+	} else if (vendor) {
 		min_channels = 24;
 		max_channels = 64;
 	} else {
@@ -892,7 +900,7 @@ static int set_stream_hw(struct motu_avb *motu, struct snd_pcm_substream *substr
 		SNDRV_PCM_INFO_BATCH |
 		SNDRV_PCM_INFO_INTERLEAVED |
 		SNDRV_PCM_INFO_BLOCK_TRANSFER |
-		SNDRV_PCM_INFO_FIFO_IN_FRAMES |
+		SNDRV_PCM_INFO_FIFO_IN_FRAMES | 
 		SNDRV_PCM_INFO_JOINT_DUPLEX;
 	substream->runtime->hw.formats = SNDRV_PCM_FMTBIT_S24_3LE;
 	substream->runtime->hw.rates = 	snd_pcm_rate_to_rate_bit(44100) | 
@@ -900,9 +908,9 @@ static int set_stream_hw(struct motu_avb *motu, struct snd_pcm_substream *substr
 									snd_pcm_rate_to_rate_bit(88200) | 
 									snd_pcm_rate_to_rate_bit(96000) | 
 									snd_pcm_rate_to_rate_bit(176400) | 
-									snd_pcm_rate_to_rate_bit(196000);
+									snd_pcm_rate_to_rate_bit(192000);
 	substream->runtime->hw.rate_min = 44100;
-	substream->runtime->hw.rate_max = 196000;
+	substream->runtime->hw.rate_max = 192000;
 	substream->runtime->hw.channels_min = min_channels;
 	substream->runtime->hw.channels_max = max_channels;
 	substream->runtime->hw.buffer_bytes_max = 45000 * 1024;
@@ -1009,7 +1017,6 @@ static int alloc_stream_urbs(struct motu_avb *motu, struct motu_avb_stream *stre
 	struct motu_avb_urb *urb_ctx;
 	unsigned int urb_no, urb_packs, isoc_no; 
 	unsigned int period_size = params_period_size(params);
-	unsigned int period_bytes = period_size * stream->frame_bytes;
 	unsigned int freqmax = motu->rate + (motu->rate >> 1);
 	unsigned int maxsize = DIV_ROUND_UP(freqmax, 8000);
 	
@@ -1068,15 +1075,19 @@ static void set_channels(struct motu_avb_stream *stream, struct motu_avb *motu, 
     {
 		stream->channels = 24;
     }
+    
+    if (vendor && channels > 0 && channels <= stream->channels) {
+    	stream->channels = channels;
+    }
 
-	stream->frame_bytes = motu->capture.channels*3;
+	stream->frame_bytes = stream->channels*3;
 }
 
 static int capture_pcm_hw_params(struct snd_pcm_substream *substream,
 				 struct snd_pcm_hw_params *hw_params)
 {
 	struct motu_avb *motu = substream->private_data;
-	int err = 0;
+	int err = 0, err_sample = 0;
 	unsigned int rate = params_rate(hw_params);
 	unsigned int pcm_channels = params_channels(hw_params);
 	bool rate_change = motu->rate != rate;
@@ -1091,14 +1102,19 @@ static int capture_pcm_hw_params(struct snd_pcm_substream *substream,
 	
 	if (motu->capture.channels != pcm_channels) {
 		dev_warn(&motu->dev->dev, "Motu AVB: Number of channels %u not possible\n", pcm_channels);
-		return -ENXIO;
+		err = -ENXIO;
 	}
 	
 	mutex_lock(&motu->mutex);
 	err = alloc_stream_urbs(motu, &motu->capture, capture_urb_complete, hw_params);
 	if (err < 0)
 		goto probe_error;
-		
+	
+	if (err_sample < 0) {
+		mutex_unlock(&motu->mutex);
+		return err_sample;
+	}
+	
 probe_error:
 	mutex_unlock(&motu->mutex);
 	return err;
@@ -1108,7 +1124,7 @@ static int playback_pcm_hw_params(struct snd_pcm_substream *substream,
 				  struct snd_pcm_hw_params *hw_params)
 {
 	struct motu_avb *motu = substream->private_data;
-	int err = 0;
+	int err = 0, err_sample = 0;
 	unsigned int rate = params_rate(hw_params);
 	unsigned int pcm_channels = params_channels(hw_params);
 	bool rate_change = motu->rate != rate;
@@ -1124,13 +1140,18 @@ static int playback_pcm_hw_params(struct snd_pcm_substream *substream,
 	
 	if (motu->playback.channels != pcm_channels) {
 		dev_warn(&motu->dev->dev, "Motu AVB: Number of channels %u not possible\n", pcm_channels);
-		return -ENXIO;
+		err_sample = -ENXIO;
 	}
 	
 	mutex_lock(&motu->mutex);
 	err = alloc_stream_urbs(motu, &motu->playback, playback_urb_complete, hw_params);
 	if (err < 0)
 		goto probe_error;
+		
+	if (err_sample < 0) {
+		mutex_unlock(&motu->mutex);
+		return err_sample;
+	}
 	
 probe_error:
 	mutex_unlock(&motu->mutex);
@@ -1173,7 +1194,6 @@ static int capture_pcm_prepare(struct snd_pcm_substream *substream)
 		return -ENODEV;
 	if (!test_bit(USB_CAPTURE_RUNNING, &motu->states))
 		return -EIO;
-
 	return 0;
 }
 
@@ -1219,7 +1239,6 @@ static int playback_pcm_prepare(struct snd_pcm_substream *substream)
 		return -ENODEV;
 	if (!test_bit(USB_PLAYBACK_RUNNING, &motu->states))
 		return -EIO;
-
 	return 0;
 }
 
