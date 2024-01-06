@@ -19,7 +19,7 @@
 #include "usbaudio.h"
 #include "midi.h"
 
-MODULE_DESCRIPTION("Motu AVB driver");
+MODULE_DESCRIPTION("Motu AVB ESS Driver");
 MODULE_AUTHOR("Roland Mueller <roland.mueller.1994@gmx.de>");
 MODULE_LICENSE("GPL v2");
 
@@ -52,10 +52,10 @@ module_param(vendor, bool, 0444);
 MODULE_PARM_DESC(vendor, "vendor");
 
 enum {
-        INTF_AUDIOCONTROL,
+    INTF_AUDIOCONTROL,
 	INTF_PLAYBACK,
 	INTF_CAPTURE,
-        INTF_VENDOR,
+    INTF_VENDOR,
 	INTF_MIDI,
 	INTF_VENDOR_OUT,
 	INTF_VENDOR_IN,
@@ -76,8 +76,6 @@ enum {
 	PLAYBACK_URB_COMPLETED,
 	DISCONNECTED,
 };
-
-//			struct usb_iso_packet_descriptor iso_frame_desc[1];
 
 struct motu_avb;
 
@@ -109,7 +107,6 @@ struct motu_avb {
 	/* FIFO to synchronize playback rate to capture rate */
 	unsigned int rate_feedback_start;
 	unsigned int rate_feedback_count;
-	//u8 rate_feedback[DEFAULT_QUEUE_LENGTH * 8];
 
 	struct list_head ready_playback_urbs;
 	wait_queue_head_t alsa_capture_wait;
@@ -134,6 +131,8 @@ struct motu_avb {
 		struct motu_avb_urb urbs[DEFAULT_QUEUE_LENGTH];
 	} capture, playback;
 	
+	/* Packet size info. Offset and length information from capture urbs stored
+	for later usage in playback. */
 	struct packet_info {
 		unsigned int packet_size[URB_PACKS];
 		unsigned int packets;
@@ -161,17 +160,12 @@ static inline void add_with_wraparound(struct motu_avb *motu,
 
 static void set_samplerate(struct motu_avb *motu)
 {
-        __le32 data;
-/*        unsigned char data1; */
-        int err;
-/*        int count = 100; */
-
-        void *data_buf = NULL;
+	__le32 data;
+	int err;
+	void *data_buf = NULL;
 
 	if (motu->samplerate_is_set)
 		return;
-		
-	printk(KERN_WARNING "Setting samplerate to %u\n", motu->rate);
 
     data = cpu_to_le32(motu->rate);
 
@@ -191,9 +185,7 @@ static void set_samplerate(struct motu_avb *motu)
 				   __func__,  motu->rate);
 
     motu->samplerate_is_set = true;
-
-    dev_warn(&motu->dev->dev, "Motu driver 0.4\n");
-
+    dev_warn(&motu->dev->dev, "Motu AVB ESS Driver\n");
     kfree(data_buf);
 }
 
@@ -239,8 +231,9 @@ static void abort_usb_playback(struct motu_avb *motu)
 		wake_up(&motu->alsa_playback_wait);
 }
 
-
-static bool check_avail(struct motu_avb_stream *stream, unsigned int needed, bool running) {
+static unsigned int calc_avail(struct motu_avb_stream *stream, bool running)
+{
+	/* Logic to calculate the available bytes in the pcm buffer. Copied from the alsa class driver */
 	struct snd_pcm_runtime *runtime;
 	struct snd_pcm_substream *subs;
 	unsigned int frame_bytes, hwptr, avail=0;
@@ -258,6 +251,13 @@ static bool check_avail(struct motu_avb_stream *stream, unsigned int needed, boo
 			avail += runtime->buffer_size;
 		avail -= hwptr;
 	}
+	return avail;
+}
+
+static bool check_avail(struct motu_avb_stream *stream, unsigned int needed, bool running) 
+{
+	unsigned int avail = calc_avail(stream, running);
+	
 	return needed > avail;
 }
 
@@ -283,14 +283,7 @@ static int copy_playback_data(struct motu_avb_stream *stream, struct urb *urb,
 	frame_bytes = stream->frame_bytes;
 	hwptr = stream->buffer_pos / frame_bytes;
 
-	if (running) {
-		/* calculate the byte offset-in-buffer of the appl_ptr */
-		avail = (runtime->control->appl_ptr - runtime->hw_ptr_base)
-			% runtime->buffer_size;
-		if (avail <= hwptr)
-			avail += runtime->buffer_size;
-		avail -= hwptr;
-	}
+	avail = calc_avail(stream, running);
 	
 	cur_packet = &ctx->motu->next_packet[ctx->motu->rate_feedback_start];
 	add_with_wraparound(ctx->motu, &ctx->motu->rate_feedback_start, 1);
@@ -326,8 +319,6 @@ static int copy_playback_data(struct motu_avb_stream *stream, struct urb *urb,
 			period_pos += cur_frames;
 			if (period_pos >= runtime->period_size) {
 				period_pos -= runtime->period_size;
-				if (period_elapsed)
-					printk(KERN_WARNING "More than one period used\n");
 				period_elapsed = true;
 			}
 		} else {
@@ -336,7 +327,12 @@ static int copy_playback_data(struct motu_avb_stream *stream, struct urb *urb,
 		}
 		counts += cur_frames;
 	}
-	if (counts > avail) {		
+	if (counts > avail) {	
+		/* 
+		In case there was not enough data in the pcm ring buffer, we just send silence.
+		This is done such that there are no dropouts in playback stream which might cause
+		channel hopping or decimated sound.
+		*/	
 		for (i = 0; i < cur_packet->packets; i++) {
 			cur_frames = cur_packet->packet_size[i];
 			ctx->packet_size[i] = cur_frames;
@@ -393,7 +389,12 @@ static void playback_tasklet(struct motu_avb *data)
 		list_del(&urb->ready_list);
 		
 		if (motu->playback.silent_urbs > 0) {
-			if (check_avail(&motu->playback, motu->playback.default_packet_size * motu->playback.urb_packs, test_bit(ALSA_PLAYBACK_RUNNING, &motu->states))) {
+			/*
+			Sending silent urbs at the beginning of playback stream such that 2ms of data are queued. 
+			Done to comply with host controller implementation.
+			*/
+			if (check_avail(&motu->playback, motu->playback.default_packet_size * motu->playback.urb_packs, 
+					test_bit(ALSA_PLAYBACK_RUNNING, &motu->states))) {
 				counts = 0;
 				frame_bytes = motu->playback.frame_bytes;
 				for (i = 0; i < motu->playback.urb_packs; i++) {
@@ -464,8 +465,19 @@ static void playback_urb_complete(struct urb *urb)
 	}
 	
 	if ((urb->start_frame & 0x3ff) != motu->next_playback_frame) {
-		printk(KERN_WARNING "ISOC delay %u!\n", (urb->start_frame & 0x3ff) - motu->next_playback_frame);
+		/*
+		If playback urbs are submitted to late, the host controller will schedule at the frame 
+		where it is able to process it. This will lead to dropouts in the iso stream which further
+		leads to channel hopping and decimated sound. This shouldn't happen in the first place but
+		we might be able to fix it here by resetting the interface.
+		For now, only log it.
+		
+		start_frame is masked with 0x3ff as this is where the EHCI driver wraps the frame number.
+		XHCI wouldn't need this.
+		*/
+		dev_err(&motu->dev->dev, "ISOC delay %u!\n", (urb->start_frame & 0x3ff) - motu->next_playback_frame);
 	}
+	// The next urb should be exactly the number of iso packets we send per urb in the future.
 	motu->next_playback_frame = (urb->start_frame + urb->number_of_packets) & 0x3ff;
 
 	if (test_bit(USB_PLAYBACK_RUNNING, &motu->states)) {
@@ -689,7 +701,6 @@ static void disable_iso_interface(struct motu_avb *motu, unsigned int intf_index
 static void stop_usb_capture(struct motu_avb *motu)
 {
 	clear_bit(USB_CAPTURE_RUNNING, &motu->states);
-	printk(KERN_WARNING "Stop capture called\n");
 
 	kill_stream_urbs(&motu->capture);
 
@@ -708,8 +719,6 @@ static int start_usb_capture(struct motu_avb *motu)
 {
 	int err = 0;
 	
-	printk(KERN_WARNING "Start capture called\n");
-	
 	motu->capture.first = true;
 	motu->capture.discard = 2;
 
@@ -720,7 +729,12 @@ static int start_usb_capture(struct motu_avb *motu)
 		return 0;
 
 	kill_stream_urbs(&motu->capture);
-
+	
+	/* 
+	We enable caputer and playback interface at the same time as it takes some time
+	and therefore increases the io-delay. Whichever stream is started first will enable
+	the interface.
+	*/
 	if (vendor)
 	{
 		err = enable_iso_interface(motu, INTF_VENDOR_IN);
@@ -746,7 +760,6 @@ static int start_usb_capture(struct motu_avb *motu)
 	motu->rate_feedback_count = 0;
 
 	set_bit(USB_CAPTURE_RUNNING, &motu->states);
-	printk(KERN_WARNING "Before submit stream\n");
 	err = submit_stream_urbs(motu, &motu->capture);
 	if (err < 0)
 		stop_usb_capture(motu);
@@ -755,7 +768,6 @@ static int start_usb_capture(struct motu_avb *motu)
 
 static void stop_usb_playback(struct motu_avb *motu)
 {
-	printk(KERN_WARNING "Stop playback called\n");
 	clear_bit(USB_PLAYBACK_RUNNING, &motu->states);
 
 	kill_stream_urbs(&motu->playback);
@@ -773,7 +785,6 @@ static void stop_usb_playback(struct motu_avb *motu)
 
 static int start_usb_playback(struct motu_avb *motu)
 {
-	printk(KERN_WARNING "Start playback called\n");
 	unsigned int i;
 	int err = 0;
 
@@ -784,6 +795,11 @@ static int start_usb_playback(struct motu_avb *motu)
 
 	kill_stream_urbs(&motu->playback);
 
+	/* 
+	We enable caputer and playback interface at the same time as it takes some time
+	and therefore increases the io-delay. Whichever stream is started first will enable
+	the interface.
+	*/
 	if (vendor)
 	{
 		err = enable_iso_interface(motu, INTF_VENDOR_IN);
@@ -809,7 +825,7 @@ static int start_usb_playback(struct motu_avb *motu)
 	spin_lock_irq(&motu->lock);
 	INIT_LIST_HEAD(&motu->ready_playback_urbs);
 
-        /* reset rate feedback */
+    /* reset rate feedback */
 	motu->rate_feedback_start = 0;
 	motu->rate_feedback_count = 0;
 	spin_unlock_irq(&motu->lock);
@@ -917,9 +933,7 @@ static int capture_pcm_open(struct snd_pcm_substream *substream)
 	mutex_unlock(&motu->mutex);
 	motu->capture.opened_count++;
 
-        dev_err(&motu->dev->dev, "capture_open\n");
-
-        //set_samplerate(motu);
+	dev_warn(&motu->dev->dev, "Motu AVB: Capture_open\n");
         
     err = set_stream_hw(motu, substream, motu->capture.channels);
 	if (err < 0)
@@ -943,9 +957,7 @@ static int playback_pcm_open(struct snd_pcm_substream *substream)
 	mutex_unlock(&motu->mutex);
 	motu->playback.opened_count++;
 
-        dev_err(&motu->dev->dev, "playback_open\n");
-
-        //set_samplerate(motu);
+	dev_warn(&motu->dev->dev, "Motu AVB: Playback_open\n");
         
     err = set_stream_hw(motu, substream, motu->playback.channels);
 	if (err < 0)
@@ -1078,7 +1090,7 @@ static int capture_pcm_hw_params(struct snd_pcm_substream *substream,
 	substream->runtime->delay = substream->runtime->hw.fifo_size;
 	
 	if (motu->capture.channels != pcm_channels) {
-		printk(KERN_WARNING "Number of channels %u not possible\n", pcm_channels);
+		dev_warn(&motu->dev->dev, "Motu AVB: Number of channels %u not possible\n", pcm_channels);
 		return -ENXIO;
 	}
 	
@@ -1086,8 +1098,7 @@ static int capture_pcm_hw_params(struct snd_pcm_substream *substream,
 	err = alloc_stream_urbs(motu, &motu->capture, capture_urb_complete, hw_params);
 	if (err < 0)
 		goto probe_error;
-	
-	printk(KERN_WARNING "capture_hw_params\n");
+		
 probe_error:
 	mutex_unlock(&motu->mutex);
 	return err;
@@ -1112,7 +1123,7 @@ static int playback_pcm_hw_params(struct snd_pcm_substream *substream,
 	motu->playback.default_packet_size = DIV_ROUND_UP(rate, 8000);
 	
 	if (motu->playback.channels != pcm_channels) {
-		printk(KERN_WARNING "Number of channels %u not possible\n", pcm_channels);
+		dev_warn(&motu->dev->dev, "Motu AVB: Number of channels %u not possible\n", pcm_channels);
 		return -ENXIO;
 	}
 	
@@ -1121,7 +1132,6 @@ static int playback_pcm_hw_params(struct snd_pcm_substream *substream,
 	if (err < 0)
 		goto probe_error;
 	
-	printk(KERN_WARNING "playback_pcm_hw_params\n");
 probe_error:
 	mutex_unlock(&motu->mutex);
 	return err;
@@ -1138,7 +1148,6 @@ static int capture_pcm_prepare(struct snd_pcm_substream *substream)
 		return 0;
 	}
 	motu->capture.needs_prepare = false;
-	printk(KERN_WARNING "capture_pcm_prepare\n");
 	
 	err = 0;
 	if (!test_bit(USB_CAPTURE_RUNNING, &motu->states))
@@ -1149,7 +1158,6 @@ static int capture_pcm_prepare(struct snd_pcm_substream *substream)
 	if (err < 0)
 		return err;
 		
-	printk(KERN_WARNING "capture started\n");
 	motu->capture.period_pos = 0;
 	motu->capture.buffer_pos = 0;
 	/*
@@ -1180,12 +1188,11 @@ static int playback_pcm_prepare(struct snd_pcm_substream *substream)
 		return 0;
 	}
 	motu->playback.needs_prepare = false;
-	printk(KERN_WARNING "playback_pcm_prepare\n");
 	
 	motu->playback.first = true;
 	motu->playback.discard = 0;
 	motu->playback.silent_urbs = 16 / motu->capture.urb_packs;
-	printk(KERN_WARNING "silent urbs %u\n", motu->playback.silent_urbs);
+	dev_warn(&motu->dev->dev, "Motu AVB: Number of silent urbs %u\n", motu->playback.silent_urbs);
 	
 	if (!test_bit(USB_CAPTURE_RUNNING, &motu->states)) {
 		err = start_usb_capture(motu);
@@ -1202,7 +1209,6 @@ static int playback_pcm_prepare(struct snd_pcm_substream *substream)
 	mutex_unlock(&motu->mutex);
 	if (err < 0)
 		return err;
-	printk(KERN_WARNING "playback started\n");
 		
 	set_bit(ALSA_PLAYBACK_OPEN, &motu->states);
 
@@ -1299,12 +1305,11 @@ static const struct snd_pcm_ops playback_pcm_ops = {
 
 static int detect_usb_format(struct motu_avb *motu)
 {
-        const struct usb_endpoint_descriptor *epd;
+    const struct usb_endpoint_descriptor *epd;
 
-        motu->format_bit = SNDRV_PCM_FMTBIT_S24_3LE;
+    motu->format_bit = SNDRV_PCM_FMTBIT_S24_3LE;
 	motu->packets_per_second = 8000;
 	
-	printk(KERN_WARNING "detect usb\n");
 
 	if (vendor)
 	{
@@ -1316,13 +1321,13 @@ static int detect_usb_format(struct motu_avb *motu)
 	}
 
 	if (!usb_endpoint_is_isoc_in(epd)) {
-		dev_err(&motu->dev->dev, "invalid capture endpoint\n");
+		dev_err(&motu->dev->dev, "Motu AVB: Invalid capture endpoint\n");
 		return -ENXIO;
 	}
 	motu->capture.usb_pipe = usb_rcvisocpipe(motu->dev, usb_endpoint_num(epd));
 	motu->capture.max_packet_bytes = usb_endpoint_maxp_mult(epd)*usb_endpoint_maxp(epd);
 
-        dev_err(&motu->dev->dev, "max packets capture endpoint %d\n", motu->capture.max_packet_bytes);
+    dev_warn(&motu->dev->dev, "Motu AVB: Max packets capture endpoint %d\n", motu->capture.max_packet_bytes);
 
 	if (vendor)
 	{
@@ -1334,20 +1339,20 @@ static int detect_usb_format(struct motu_avb *motu)
 	}
 
 	if (!usb_endpoint_is_isoc_out(epd)) {
-		dev_err(&motu->dev->dev, "invalid playback endpoint\n");
+		dev_err(&motu->dev->dev, "Motu AVB: Invalid playback endpoint\n");
 		return -ENXIO;
 	}
 	motu->playback.usb_pipe = usb_sndisocpipe(motu->dev, usb_endpoint_num(epd));
 	motu->playback.max_packet_bytes = usb_endpoint_maxp_mult(epd)*usb_endpoint_maxp(epd);
 
-        dev_err(&motu->dev->dev, "max packets playback endpoint %d\n", motu->playback.max_packet_bytes);
+    dev_warn(&motu->dev->dev, "Motu AVB: Max packets playback endpoint %d\n", motu->playback.max_packet_bytes);
 
 	return 0;
 }
 
 static void free_stream_urbs(struct motu_avb_stream *stream)
 {
-	unsigned int urb_no; // i, 
+	unsigned int urb_no;
 	struct motu_avb_urb * urb_ctx;
 
 	for (urb_no = 0; urb_no < stream->queue_length; urb_no++) {
@@ -1405,22 +1410,22 @@ static int motu_avb_probe(struct usb_interface *interface,
 	};
 	static const int intf_numbers[2][8] = {
 		{	/* AVB devices without MIDI */
-                        [INTF_AUDIOCONTROL] = 0,
+            [INTF_AUDIOCONTROL] = 0,
 			[INTF_PLAYBACK] = 1,
 			[INTF_CAPTURE] = 2,
-                        [INTF_VENDOR] = 3,
+            [INTF_VENDOR] = 3,
 			[INTF_VENDOR_OUT] = 4,
 			[INTF_VENDOR_IN] = 5,
 			[INTF_UNUSED] = -1,
 			[INTF_MIDI] = -1,
 		},
 		{	/* AVB devices with MIDI */
-                        [INTF_AUDIOCONTROL] = 0,
+            [INTF_AUDIOCONTROL] = 0,
 			[INTF_PLAYBACK] = 1,
 			[INTF_CAPTURE] = 2,
 			[INTF_UNUSED] = 3,
 			[INTF_MIDI] = 4,
-                        [INTF_VENDOR] = 5,
+            [INTF_VENDOR] = 5,
 			[INTF_VENDOR_OUT] = 6,
 			[INTF_VENDOR_IN] = 7,
 		},
@@ -1471,7 +1476,7 @@ static int motu_avb_probe(struct usb_interface *interface,
 	motu->playback.opened_count = 0;
 	motu->playback.needs_prepare = true;
 
-    dev_info(&motu->dev->dev, "queue_length = %d, midi = %d, vendor = %d\n", queue_length, midi, vendor);
+    dev_info(&motu->dev->dev, "Motu AVB: midi = %d, vendor = %d\n", midi, vendor);
 
 	motu->intf[0] = interface;
 	for (i = 1; i < ARRAY_SIZE(motu->intf); ++i) {
