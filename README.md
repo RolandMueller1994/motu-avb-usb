@@ -2,6 +2,8 @@
 Linux USB driver for the MOTU AVB series interfaces.
 This version was tested with the Ultralite AVB ESS devices and tries to solve the problems with channel hopping and decimated sound.
 
+**Main branch is to be used for kernel version >=6.5.0. If you're running kernel version <6.5.0, use branch pre_kernel_6.5**.
+
 ## Module parameters:
 
 midi: set 1 for devices that have a midi port, 0 for the ones that don't
