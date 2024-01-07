@@ -40,6 +40,7 @@ static unsigned int queue_length = DEFAULT_QUEUE_LENGTH;
 static bool midi = 0;
 static bool vendor = 0;
 static unsigned int channels = 0;
+static bool queue_urbs = 1;
 
 module_param_array(index, int, NULL, 0444);
 MODULE_PARM_DESC(index, "card index");
@@ -51,6 +52,8 @@ module_param(midi, bool, 0444);
 MODULE_PARM_DESC(midi, "device has midi ports");
 module_param(vendor, bool, 0444);
 MODULE_PARM_DESC(vendor, "vendor");
+module_param(queue_urbs, bool, 0444);
+MODULE_PARM_DESC(queue_urbs, "Send silent urbs at startup");
 
 module_param(channels, uint, 0444);
 MODULE_PARM_DESC(channels, "channels");
@@ -89,7 +92,6 @@ struct motu_avb_urb {
 	unsigned int packets;
 	unsigned int buffer_size;
 	unsigned int packet_size[8];
-	//struct usb_iso_packet_descriptor iso_frame_desc[1];
 	struct list_head ready_list;
 };
 
@@ -264,7 +266,6 @@ static bool check_avail(struct motu_avb_stream *stream, unsigned int needed, boo
 	
 	return needed > avail;
 }
-
 
 /* copy data from the ALSA ring buffer into the URB buffer */
 static int copy_playback_data(struct motu_avb_stream *stream, struct urb *urb,
@@ -481,6 +482,11 @@ static void playback_urb_complete(struct urb *urb)
 		XHCI wouldn't need this.
 		*/
 		dev_err(&motu->dev->dev, "ISOC delay %u!\n", (urb->start_frame & 0x3ff) - motu->next_playback_frame);
+		motu->playback.needs_prepare = true;
+		motu->capture.needs_prepare = true;
+		abort_usb_playback(motu);
+		abort_alsa_playback(motu);
+		abort_usb_capture(motu);
 	}
 	// The next urb should be exactly the number of iso packets we send per urb in the future.
 	motu->next_playback_frame = (urb->start_frame + urb->number_of_packets) & 0x3ff;
@@ -733,13 +739,8 @@ static int start_usb_capture(struct motu_avb *motu)
 	if (test_bit(USB_CAPTURE_RUNNING, &motu->states))
 		return 0;
 
-	kill_stream_urbs(&motu->capture);
+	stop_usb_capture(motu);
 	
-	/* 
-	We enable caputer and playback interface at the same time as it takes some time
-	and therefore increases the io-delay. Whichever stream is started first will enable
-	the interface.
-	*/
 	if (vendor)
 	{
 		err = enable_iso_interface(motu, INTF_VENDOR_IN);
@@ -748,15 +749,7 @@ static int start_usb_capture(struct motu_avb *motu)
 	{
 		err = enable_iso_interface(motu, INTF_CAPTURE);
 	}
-	
-	if (vendor)
-	{
-		err = enable_iso_interface(motu, INTF_VENDOR_OUT);
-	}
-	else
-	{
-		err = enable_iso_interface(motu, INTF_PLAYBACK);
-	}
+
 	if (err < 0) {
 		return err;
 	}
@@ -797,24 +790,8 @@ static int start_usb_playback(struct motu_avb *motu)
 	if (test_bit(DISCONNECTED, &motu->states))
 		return -ENODEV;
 
-	clear_bit(USB_PLAYBACK_RUNNING, &motu->states);
+	stop_usb_playback(motu);
 
-	kill_stream_urbs(&motu->playback);
-
-	/* 
-	We enable caputer and playback interface at the same time as it takes some time
-	and therefore increases the io-delay. Whichever stream is started first will enable
-	the interface.
-	*/
-	if (vendor)
-	{
-		err = enable_iso_interface(motu, INTF_VENDOR_IN);
-	}
-	else
-	{
-		err = enable_iso_interface(motu, INTF_CAPTURE);
-	}
-	
 	if (vendor)
 	{
 		err = enable_iso_interface(motu, INTF_VENDOR_OUT);
@@ -835,6 +812,8 @@ static int start_usb_playback(struct motu_avb *motu)
     /* reset rate feedback */
 	motu->rate_feedback_start = 0;
 	motu->rate_feedback_count = 0;
+	motu->playback.period_pos = 0;
+	motu->playback.buffer_pos = 0;
 	spin_unlock_irq(&motu->lock);
 
 	if (err < 0)
@@ -935,6 +914,7 @@ static int capture_pcm_open(struct snd_pcm_substream *substream)
 
 	mutex_lock(&motu->mutex);
 	if (motu->capture.opened_count > 0) {
+		motu->capture.opened_count++;
 		mutex_unlock(&motu->mutex);
 		return 0;
 	}
@@ -959,6 +939,7 @@ static int playback_pcm_open(struct snd_pcm_substream *substream)
 	
 	mutex_lock(&motu->mutex);
 	if (motu->playback.opened_count > 0) {
+		motu->playback.opened_count++;
 		mutex_unlock(&motu->mutex);
 		return 0;
 	}
@@ -1164,7 +1145,7 @@ static int capture_pcm_prepare(struct snd_pcm_substream *substream)
 	int err;
 	
 	mutex_lock(&motu->mutex);
-	if (test_bit(ALSA_CAPTURE_OPEN, &motu->states) || !motu->capture.needs_prepare) {
+	if (test_bit(ALSA_CAPTURE_OPEN, &motu->states) && !motu->capture.needs_prepare) {
 		mutex_unlock(&motu->mutex);
 		return 0;
 	}
@@ -1203,7 +1184,7 @@ static int playback_pcm_prepare(struct snd_pcm_substream *substream)
 	int err; 
 	
 	mutex_lock(&motu->mutex);
-	if (test_bit(ALSA_PLAYBACK_OPEN, &motu->states) || !motu->playback.needs_prepare) {
+	if (test_bit(ALSA_PLAYBACK_OPEN, &motu->states) && !motu->playback.needs_prepare) {
 		mutex_unlock(&motu->mutex);
 		return 0;
 	}
@@ -1211,7 +1192,10 @@ static int playback_pcm_prepare(struct snd_pcm_substream *substream)
 	
 	motu->playback.first = true;
 	motu->playback.discard = 0;
-	motu->playback.silent_urbs = 16 / motu->capture.urb_packs;
+	if (queue_urbs)
+		motu->playback.silent_urbs = 16 / motu->capture.urb_packs;
+	else
+		motu->playback.silent_urbs = 0;
 	dev_warn(&motu->dev->dev, "Motu AVB: Number of silent urbs %u\n", motu->playback.silent_urbs);
 	
 	if (!test_bit(USB_CAPTURE_RUNNING, &motu->states)) {
@@ -1221,9 +1205,6 @@ static int playback_pcm_prepare(struct snd_pcm_substream *substream)
 			return err;
 		}
 	}
-	
-	motu->playback.period_pos = 0;
-	motu->playback.buffer_pos = 0;
 
 	err = start_usb_playback(motu);
 	mutex_unlock(&motu->mutex);
