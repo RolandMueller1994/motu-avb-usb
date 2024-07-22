@@ -19,6 +19,8 @@
 #include "usbaudio.h"
 #include "midi.h"
 
+//#define DEBUG
+
 MODULE_DESCRIPTION("Motu AVB ESS Driver");
 MODULE_AUTHOR("Roland Mueller <roland.mueller.1994@gmx.de>");
 MODULE_LICENSE("GPL v2");
@@ -264,7 +266,7 @@ static bool check_avail(struct motu_avb_stream *stream, unsigned int needed, boo
 {
 	unsigned int avail = calc_avail(stream, running);
 	
-	return needed > avail;
+	return needed < avail;
 }
 
 /* copy data from the ALSA ring buffer into the URB buffer */
@@ -276,7 +278,7 @@ static int copy_playback_data(struct motu_avb_stream *stream, struct urb *urb,
 	struct motu_avb_urb * ctx;
 	struct packet_info * cur_packet;
 	
-	unsigned int frame_bytes, frames1, i, cur_frames, counts = 0, avail = 0, buffer_pos, period_pos;
+	unsigned int frame_bytes, frames1, i, cur_frames, counts = 0, avail = 0, buffer_pos, period_pos, periods=0;
 	const u8 *source;
 	unsigned int hwptr;
 	bool period_elapsed = false, buffer_overflow = false;
@@ -325,6 +327,7 @@ static int copy_playback_data(struct motu_avb_stream *stream, struct urb *urb,
 			if (period_pos >= runtime->period_size) {
 				period_pos -= runtime->period_size;
 				period_elapsed = true;
+				periods += 1;
 			}
 		} else {
 			memset(urb->transfer_buffer + counts * frame_bytes, 0,
@@ -338,6 +341,9 @@ static int copy_playback_data(struct motu_avb_stream *stream, struct urb *urb,
 		This is done such that there are no dropouts in playback stream which might cause
 		channel hopping or decimated sound.
 		*/	
+#ifdef DEBUG
+		dev_err(&ctx->motu->dev->dev, "Sending zeros: Counts %u Avail %u\n", counts, avail);
+#endif
 		counts = 0;
 		for (i = 0; i < cur_packet->packets; i++) {
 			cur_frames = cur_packet->packet_size[i];
@@ -354,6 +360,12 @@ static int copy_playback_data(struct motu_avb_stream *stream, struct urb *urb,
 	}
 	stream->buffer_pos = buffer_pos;
 	stream->period_pos = period_pos;
+#ifdef DEBUG
+	if (periods > 1) {
+		dev_err(&ctx->motu->dev->dev, "More than one period: %u\n", periods);
+	}
+#endif
+
 	if (period_elapsed)
 		return 1;
 	return 0;
@@ -399,8 +411,15 @@ static void playback_tasklet(struct motu_avb *data)
 			Sending silent urbs at the beginning of playback stream such that 2ms of data are queued. 
 			Done to comply with host controller implementation.
 			*/
+#ifdef DEBUG
+			dev_err(&motu->dev->dev, "Try sending silence, Avail: %i, Running %i\n", check_avail(&motu->playback, motu->playback.default_packet_size * motu->playback.urb_packs,
+					test_bit(ALSA_PLAYBACK_RUNNING, &motu->states)), test_bit(ALSA_PLAYBACK_RUNNING, &motu->states));
+#endif
 			if (check_avail(&motu->playback, motu->playback.default_packet_size * motu->playback.urb_packs, 
 					test_bit(ALSA_PLAYBACK_RUNNING, &motu->states))) {
+#ifdef DEBUG
+				dev_err(&motu->dev->dev, "Sending silence\n");
+#endif
 				counts = 0;
 				frame_bytes = motu->playback.frame_bytes;
 				for (i = 0; i < motu->playback.urb_packs; i++) {
@@ -475,8 +494,7 @@ static void playback_urb_complete(struct urb *urb)
 		If playback urbs are submitted to late, the host controller will schedule at the frame 
 		where it is able to process it. This will lead to dropouts in the iso stream which further
 		leads to channel hopping and decimated sound. This shouldn't happen in the first place but
-		we might be able to fix it here by resetting the interface.
-		For now, only log it.
+		we are able to fix it here by resetting the interface.
 		
 		start_frame is masked with 0x3ff as this is where the EHCI driver wraps the frame number.
 		XHCI wouldn't need this.
@@ -712,6 +730,9 @@ static void disable_iso_interface(struct motu_avb *motu, unsigned int intf_index
 static void stop_usb_capture(struct motu_avb *motu)
 {
 	clear_bit(USB_CAPTURE_RUNNING, &motu->states);
+#ifdef DEBUG
+	dev_warn(&motu->dev->dev, "Motu AVB: Stop usb capture called\n");
+#endif
 
 	kill_stream_urbs(&motu->capture);
 
@@ -729,7 +750,7 @@ static void stop_usb_capture(struct motu_avb *motu)
 static int start_usb_capture(struct motu_avb *motu)
 {
 	int err = 0;
-	
+
 	motu->capture.first = true;
 	motu->capture.discard = 2;
 
@@ -740,7 +761,10 @@ static int start_usb_capture(struct motu_avb *motu)
 		return 0;
 
 	stop_usb_capture(motu);
-	
+#ifdef DEBUG
+	dev_warn(&motu->dev->dev, "Motu AVB: Start usb capture called\n");
+#endif
+
 	if (vendor)
 	{
 		err = enable_iso_interface(motu, INTF_VENDOR_IN);
@@ -751,6 +775,7 @@ static int start_usb_capture(struct motu_avb *motu)
 	}
 
 	if (err < 0) {
+		dev_warn(&motu->dev->dev, "Motu AVB: Playback iso int err %i\n", err);
 		return err;
 	}
 
@@ -768,6 +793,9 @@ static int start_usb_capture(struct motu_avb *motu)
 static void stop_usb_playback(struct motu_avb *motu)
 {
 	clear_bit(USB_PLAYBACK_RUNNING, &motu->states);
+#ifdef DEBUG
+	dev_warn(&motu->dev->dev, "Motu AVB: Stop usb playback called\n");
+#endif
 
 	kill_stream_urbs(&motu->playback);
 
@@ -785,12 +813,16 @@ static void stop_usb_playback(struct motu_avb *motu)
 static int start_usb_playback(struct motu_avb *motu)
 {
 	unsigned int i;
+
 	int err = 0;
 
 	if (test_bit(DISCONNECTED, &motu->states))
 		return -ENODEV;
 
 	stop_usb_playback(motu);
+#ifdef DEBUG
+	dev_warn(&motu->dev->dev, "Motu AVB: Start usb playback called\n");
+#endif
 
 	if (vendor)
 	{
@@ -802,6 +834,7 @@ static int start_usb_playback(struct motu_avb *motu)
 	}
 
 	if (err < 0) {
+		dev_warn(&motu->dev->dev, "Motu AVB: Playback iso int err %i\n", err);
 		return err;
 	}
 
@@ -920,8 +953,9 @@ static int capture_pcm_open(struct snd_pcm_substream *substream)
 	}
 	mutex_unlock(&motu->mutex);
 	motu->capture.opened_count++;
-
-	dev_warn(&motu->dev->dev, "Motu AVB: Capture_open\n");
+#ifdef DEBUG
+	dev_warn(&motu->dev->dev, "Motu AVB: Capture pcm open\n");
+#endif
         
     err = set_stream_hw(motu, substream, motu->capture.channels);
 	if (err < 0)
@@ -945,8 +979,9 @@ static int playback_pcm_open(struct snd_pcm_substream *substream)
 	}
 	mutex_unlock(&motu->mutex);
 	motu->playback.opened_count++;
-
-	dev_warn(&motu->dev->dev, "Motu AVB: Playback_open\n");
+#ifdef DEBUG
+	dev_warn(&motu->dev->dev, "Motu AVB: Playback pcm open\n");
+#endif
         
     err = set_stream_hw(motu, substream, motu->playback.channels);
 	if (err < 0)
@@ -964,6 +999,9 @@ static int capture_pcm_close(struct snd_pcm_substream *substream)
 	motu->capture.opened_count--;
 	if (motu->capture.opened_count > 0)
 		goto unlock;
+#ifdef DEBUG
+	dev_warn(&motu->dev->dev, "Motu AVB: Capture pcm close\n");
+#endif
 	motu->capture.needs_prepare = true;
 	clear_bit(ALSA_CAPTURE_OPEN, &motu->states);
 	if (!test_bit(ALSA_PLAYBACK_OPEN, &motu->states))
@@ -981,6 +1019,9 @@ static int playback_pcm_close(struct snd_pcm_substream *substream)
 	motu->playback.opened_count--;
 	if (motu->playback.opened_count > 0)
 		goto unlock;
+#ifdef DEBUG
+	dev_warn(&motu->dev->dev, "Motu AVB: Playback pcm close\n");
+#endif
 	motu->playback.needs_prepare = true;
 	stop_usb_playback(motu);
 	clear_bit(ALSA_PLAYBACK_OPEN, &motu->states);
@@ -1149,6 +1190,9 @@ static int capture_pcm_prepare(struct snd_pcm_substream *substream)
 		mutex_unlock(&motu->mutex);
 		return 0;
 	}
+#ifdef DEBUG
+	dev_warn(&motu->dev->dev, "Motu AVB: Capture pcm prepare\n");
+#endif
 	motu->capture.needs_prepare = false;
 	
 	err = 0;
@@ -1188,6 +1232,9 @@ static int playback_pcm_prepare(struct snd_pcm_substream *substream)
 		mutex_unlock(&motu->mutex);
 		return 0;
 	}
+#ifdef DEBUG
+	dev_warn(&motu->dev->dev, "Motu AVB: Playback pcm prepare\n");
+#endif
 	motu->playback.needs_prepare = false;
 	
 	motu->playback.first = true;
