@@ -43,6 +43,7 @@ static bool midi = 0;
 static bool vendor = 0;
 static unsigned int channels = 0;
 static bool queue_urbs = 1;
+static int no_silent_urbs = 0;
 
 module_param_array(index, int, NULL, 0444);
 MODULE_PARM_DESC(index, "card index");
@@ -54,6 +55,8 @@ module_param(midi, bool, 0444);
 MODULE_PARM_DESC(midi, "device has midi ports");
 module_param(vendor, bool, 0444);
 MODULE_PARM_DESC(vendor, "vendor");
+module_param(no_silent_urbs, int, 0444);
+MODULE_PARM_DESC(no_silent_urbs, "Number of silent urbs to be sent before playback data");
 module_param(queue_urbs, bool, 0444);
 MODULE_PARM_DESC(queue_urbs, "Send silent urbs at startup");
 
@@ -1239,10 +1242,13 @@ static int playback_pcm_prepare(struct snd_pcm_substream *substream)
 	
 	motu->playback.first = true;
 	motu->playback.discard = 0;
-	if (queue_urbs)
+	if (no_silent_urbs > 0)
+		motu->playback.silent_urbs = no_silent_urbs < 16 ? no_silent_urbs : 16;
+	else if (queue_urbs)
 		motu->playback.silent_urbs = 16 / motu->capture.urb_packs;
 	else
 		motu->playback.silent_urbs = 0;
+	dev_warn(&motu->dev->dev, "Motu AVB: Number of silent urbs param %i\n", no_silent_urbs);
 	dev_warn(&motu->dev->dev, "Motu AVB: Number of silent urbs %u\n", motu->playback.silent_urbs);
 	
 	if (!test_bit(USB_CAPTURE_RUNNING, &motu->states)) {
