@@ -127,6 +127,7 @@ struct motu_avb {
 		struct snd_pcm_substream *substream;
 		bool first;
 		unsigned int silent_urbs;
+		unsigned int frame_print;
 		unsigned int urb_packs;
 		unsigned int default_packet_size;
 		unsigned int discard;
@@ -491,7 +492,8 @@ static void playback_urb_complete(struct urb *urb)
 		motu->next_playback_frame = urb->start_frame & 0x3ff;
 		motu->playback.substream->runtime->delay = 0;
 	}
-	
+
+#if 0
 	if ((urb->start_frame & 0x3ff) != motu->next_playback_frame) {
 		/*
 		If playback urbs are submitted to late, the host controller will schedule at the frame 
@@ -509,7 +511,15 @@ static void playback_urb_complete(struct urb *urb)
 		abort_alsa_playback(motu);
 		abort_usb_capture(motu);
 	}
-	// The next urb should be exactly the number of iso packets we send per urb in the future.
+#endif
+	if (motu->playback.frame_print > 0) {
+		dev_warn(&motu->dev->dev,
+				"Playback start frame: %u, Masked %u; Expected playback frame: %u\n",
+				urb->start_frame, urb->start_frame & 0x3ff,
+				motu->next_playback_frame);
+		motu->playback.frame_print--;
+	}
+	// The next urb should be exactly the number of iso packets we send per urb isn the future.
 	motu->next_playback_frame = (urb->start_frame + urb->number_of_packets) & 0x3ff;
 
 	if (test_bit(USB_PLAYBACK_RUNNING, &motu->states)) {
@@ -1248,6 +1258,7 @@ static int playback_pcm_prepare(struct snd_pcm_substream *substream)
 		motu->playback.silent_urbs = 16 / motu->capture.urb_packs;
 	else
 		motu->playback.silent_urbs = 0;
+	motu->playback.frame_print = 50;
 	dev_warn(&motu->dev->dev, "Motu AVB: Number of silent urbs param %i\n", no_silent_urbs);
 	dev_warn(&motu->dev->dev, "Motu AVB: Number of silent urbs %u\n", motu->playback.silent_urbs);
 	
