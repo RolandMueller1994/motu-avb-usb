@@ -19,7 +19,7 @@
 #include "usbaudio.h"
 #include "midi.h"
 
-//#define DEBUG
+#define DEBUG
 
 MODULE_DESCRIPTION("Motu AVB ESS Driver");
 MODULE_AUTHOR("Roland Mueller <roland.mueller.1994@gmx.de>");
@@ -42,8 +42,8 @@ static unsigned int queue_length = DEFAULT_QUEUE_LENGTH;
 static bool midi = 0;
 static bool vendor = 0;
 static unsigned int channels = 0;
-static bool queue_urbs = 1;
-static int no_silent_urbs = 0;
+static int time_silent = 2;
+static bool frame_check = 0;
 
 module_param_array(index, int, NULL, 0444);
 MODULE_PARM_DESC(index, "card index");
@@ -52,16 +52,15 @@ MODULE_PARM_DESC(id, "ID string");
 module_param_array(enable, bool, NULL, 0444);
 MODULE_PARM_DESC(enable, "enable card");
 module_param(midi, bool, 0444);
-MODULE_PARM_DESC(midi, "device has midi ports");
+MODULE_PARM_DESC(midi, "Device has midi ports");
 module_param(vendor, bool, 0444);
-MODULE_PARM_DESC(vendor, "vendor");
-module_param(no_silent_urbs, int, 0444);
-MODULE_PARM_DESC(no_silent_urbs, "Number of silent urbs to be sent before playback data");
-module_param(queue_urbs, bool, 0444);
-MODULE_PARM_DESC(queue_urbs, "Send silent urbs at startup");
-
+MODULE_PARM_DESC(vendor, "Enable vendor mode");
 module_param(channels, uint, 0444);
-MODULE_PARM_DESC(channels, "channels");
+MODULE_PARM_DESC(channels, "Number of channels in vendor mode. This can be used if the number of channels is changed on the interface.");
+module_param(time_silent, int, 0444);
+MODULE_PARM_DESC(time_silent, "Defines for how many milli-seconds silent is sent at the beginning of the playback stream. If not set, 2ms are used.");
+module_param(frame_check, bool, 0444);
+MODULE_PARM_DESC(frame_check, "Enables start_frame check in playback stream. This will reset the interface in case a gap in the isoc stream is detected.");
 
 enum {
     INTF_AUDIOCONTROL,
@@ -72,7 +71,6 @@ enum {
 	INTF_VENDOR_OUT,
 	INTF_VENDOR_IN,
 	INTF_UNUSED,
-
 	INTF_COUNT
 };
 
@@ -128,6 +126,7 @@ struct motu_avb {
 		bool first;
 		unsigned int silent_urbs;
 		unsigned int frame_print;
+		bool start_frame_init;
 		unsigned int urb_packs;
 		unsigned int default_packet_size;
 		unsigned int discard;
@@ -197,7 +196,9 @@ static void set_samplerate(struct motu_avb *motu)
 				   __func__,  motu->rate);
 
     motu->samplerate_is_set = true;
-    dev_warn(&motu->dev->dev, "Motu AVB ESS Driver\n");
+	dev_warn(&motu->dev->dev,
+			"Motu AVB ESS Driver. Module params: Midi %i, vendor %i, time_silent %i, frame_check %i\n",
+			midi, vendor, time_silent, frame_check);
     kfree(data_buf);
 }
 
@@ -405,11 +406,6 @@ static void playback_tasklet(struct motu_avb *data)
 	       !list_empty(&motu->ready_playback_urbs)) {
 
 		silent = false;
-		/* take URB out of FIFO */
-		urb = list_first_entry(&motu->ready_playback_urbs,
-					   struct motu_avb_urb, ready_list);
-		list_del(&urb->ready_list);
-		
 		if (motu->playback.silent_urbs > 0) {
 			/*
 			Sending silent urbs at the beginning of playback stream such that 2ms of data are queued. 
@@ -419,11 +415,16 @@ static void playback_tasklet(struct motu_avb *data)
 			dev_err(&motu->dev->dev, "Try sending silence, Avail: %i, Running %i\n", check_avail(&motu->playback, motu->playback.default_packet_size * motu->playback.urb_packs,
 					test_bit(ALSA_PLAYBACK_RUNNING, &motu->states)), test_bit(ALSA_PLAYBACK_RUNNING, &motu->states));
 #endif
-			if (check_avail(&motu->playback, motu->playback.default_packet_size * motu->playback.urb_packs, 
+			if (check_avail(&motu->playback, motu->playback.default_packet_size * motu->playback.urb_packs,
 					test_bit(ALSA_PLAYBACK_RUNNING, &motu->states))) {
 #ifdef DEBUG
 				dev_err(&motu->dev->dev, "Sending silence\n");
 #endif
+				/* take URB out of FIFO */
+				urb = list_first_entry(&motu->ready_playback_urbs,
+							   struct motu_avb_urb, ready_list);
+				list_del(&urb->ready_list);
+
 				counts = 0;
 				frame_bytes = motu->playback.frame_bytes;
 				for (i = 0; i < motu->playback.urb_packs; i++) {
@@ -441,6 +442,11 @@ static void playback_tasklet(struct motu_avb *data)
 			}
 		} else {
 			/* fill packet with data or silence */
+			/* take URB out of FIFO */
+			urb = list_first_entry(&motu->ready_playback_urbs,
+						   struct motu_avb_urb, ready_list);
+			list_del(&urb->ready_list);
+
 			copy_status = copy_playback_data(&motu->playback,
 								urb->urb,
 								frames,
@@ -493,8 +499,7 @@ static void playback_urb_complete(struct urb *urb)
 		motu->playback.substream->runtime->delay = 0;
 	}
 
-#if 0
-	if ((urb->start_frame & 0x3ff) != motu->next_playback_frame) {
+	if (((urb->start_frame & 0x3ff) != motu->next_playback_frame) && frame_check && !motu->playback.start_frame_init) {
 		/*
 		If playback urbs are submitted to late, the host controller will schedule at the frame 
 		where it is able to process it. This will lead to dropouts in the iso stream which further
@@ -510,8 +515,12 @@ static void playback_urb_complete(struct urb *urb)
 		abort_usb_playback(motu);
 		abort_alsa_playback(motu);
 		abort_usb_capture(motu);
+	} else if (((urb->start_frame & 0x3ff) == motu->next_playback_frame) && frame_check && motu->playback.start_frame_init) {
+		dev_warn(&motu->dev->dev, "Start frame check started!\n");
+		motu->playback.start_frame_init = false;
 	}
-#endif
+
+#ifdef DEBUG
 	if (motu->playback.frame_print > 0) {
 		dev_warn(&motu->dev->dev,
 				"Playback start frame: %u, Masked %u; Expected playback frame: %u\n",
@@ -519,6 +528,7 @@ static void playback_urb_complete(struct urb *urb)
 				motu->next_playback_frame);
 		motu->playback.frame_print--;
 	}
+#endif
 	// The next urb should be exactly the number of iso packets we send per urb isn the future.
 	motu->next_playback_frame = (urb->start_frame + urb->number_of_packets) & 0x3ff;
 
@@ -1252,14 +1262,14 @@ static int playback_pcm_prepare(struct snd_pcm_substream *substream)
 	
 	motu->playback.first = true;
 	motu->playback.discard = 0;
-	if (no_silent_urbs > 0)
-		motu->playback.silent_urbs = no_silent_urbs < 16 ? no_silent_urbs : 16;
-	else if (queue_urbs)
-		motu->playback.silent_urbs = 16 / motu->capture.urb_packs;
-	else
-		motu->playback.silent_urbs = 0;
+
+	unsigned int silent_urbs = time_silent * 8 / motu->capture.urb_packs;
+	silent_urbs = silent_urbs > 16 ? 16 : silent_urbs;
+	motu->playback.silent_urbs = silent_urbs;
+	motu->playback.start_frame_init = true;
+
 	motu->playback.frame_print = 50;
-	dev_warn(&motu->dev->dev, "Motu AVB: Number of silent urbs param %i\n", no_silent_urbs);
+	dev_warn(&motu->dev->dev, "Motu AVB: Timeframe to send silent urbs as playback startup %i\n", time_silent);
 	dev_warn(&motu->dev->dev, "Motu AVB: Number of silent urbs %u\n", motu->playback.silent_urbs);
 	
 	if (!test_bit(USB_CAPTURE_RUNNING, &motu->states)) {
