@@ -19,7 +19,7 @@
 #include "usbaudio.h"
 #include "midi.h"
 
-#define DEBUG
+// #define DEBUG
 
 MODULE_DESCRIPTION("Motu AVB ESS Driver");
 MODULE_AUTHOR("Roland Mueller <roland.mueller.1994@gmx.de>");
@@ -96,6 +96,7 @@ struct motu_avb_urb {
 	unsigned int buffer_size;
 	unsigned int packet_size[8];
 	struct list_head ready_list;
+	bool was_silent;
 };
 
 struct motu_avb {
@@ -244,7 +245,7 @@ static void abort_usb_playback(struct motu_avb *motu)
 		wake_up(&motu->alsa_playback_wait);
 }
 
-static unsigned int calc_avail(struct motu_avb_stream *stream, bool running)
+static unsigned int calc_avail(struct motu_avb_stream *stream, bool running, int needed)
 {
 	/* Logic to calculate the available bytes in the pcm buffer. Copied from the alsa class driver */
 	struct snd_pcm_runtime *runtime;
@@ -254,7 +255,9 @@ static unsigned int calc_avail(struct motu_avb_stream *stream, bool running)
 	subs = stream->substream;
 	runtime = stream->substream->runtime;
 	frame_bytes = stream->frame_bytes;
-	hwptr = stream->buffer_pos / frame_bytes;
+	hwptr = stream->buffer_pos;
+
+	struct motu_avb *motu = subs->private_data;
 
 	if (running) {
 		/* calculate the byte offset-in-buffer of the appl_ptr */
@@ -264,12 +267,21 @@ static unsigned int calc_avail(struct motu_avb_stream *stream, bool running)
 			avail += runtime->buffer_size;
 		avail -= hwptr;
 	}
+#ifdef DEBUG
+	if (avail < needed) {
+		dev_err(&motu->dev->dev,
+				"Avail %u , appl %u, hw_ptr_base %u, hwptr %u, buffersize %u, needed %i\n",
+				avail, runtime->control->appl_ptr, runtime->hw_ptr_base, hwptr,
+				runtime->buffer_size, needed);
+	}
+#endif
+
 	return avail;
 }
 
 static bool check_avail(struct motu_avb_stream *stream, unsigned int needed, bool running) 
 {
-	unsigned int avail = calc_avail(stream, running);
+	unsigned int avail = calc_avail(stream, running, 0);
 	
 	return needed < avail;
 }
@@ -294,8 +306,6 @@ static int copy_playback_data(struct motu_avb_stream *stream, struct urb *urb,
 	runtime = stream->substream->runtime;
 	frame_bytes = stream->frame_bytes;
 	hwptr = stream->buffer_pos / frame_bytes;
-
-	avail = calc_avail(stream, running);
 	
 	cur_packet = &ctx->motu->next_packet[ctx->motu->rate_feedback_start];
 	add_with_wraparound(ctx->motu, &ctx->motu->rate_feedback_start, 1);
@@ -340,7 +350,8 @@ static int copy_playback_data(struct motu_avb_stream *stream, struct urb *urb,
 		}
 		counts += cur_frames;
 	}
-	if (counts > avail) {	
+	avail = calc_avail(stream, running, counts);
+	if (counts > avail) {
 		/* 
 		In case there was not enough data in the pcm ring buffer, we just send silence.
 		This is done such that there are no dropouts in playback stream which might cause
@@ -361,7 +372,7 @@ static int copy_playback_data(struct motu_avb_stream *stream, struct urb *urb,
 			
 			counts += cur_frames;
 		}
-		return 0;
+		return -1;
 	}
 	stream->buffer_pos = buffer_pos;
 	stream->period_pos = period_pos;
@@ -453,13 +464,16 @@ static void playback_tasklet(struct motu_avb *data)
 								test_bit(ALSA_PLAYBACK_RUNNING, &motu->states));
 			if (copy_status > 0)
 				do_period_elapsed = true;
-			else if (copy_status < 0)
-				break;
 			for (i = 0; i < urb->packets; i++)
 				frames += urb->packet_size[i];
 			motu->rate_feedback_count--;
+			if (copy_status >= 0)
+				silent = false;
+			else
+				silent = true;
 		}
 		/* and off you go ... */
+		urb->was_silent = silent;
 		err = usb_submit_urb(urb->urb, GFP_ATOMIC);
 		if (unlikely(err < 0)) {
 			spin_unlock_irqrestore(&motu->lock, flags);
@@ -467,6 +481,7 @@ static void playback_tasklet(struct motu_avb *data)
 			abort_alsa_playback(motu);
 			dev_err(&motu->dev->dev, "USB request error %d: %s\n",
 				err, usb_error_string(err));
+			spin_unlock_irqrestore(&motu->lock, flags);
 			return;
 		}
 		if (!silent)
@@ -482,6 +497,7 @@ static void playback_urb_complete(struct urb *urb)
 {
 	//struct motu_avb_urb *urb = (struct motu_avb_urb *)usb_urb;
 	struct motu_avb *motu = ((struct motu_avb_urb *)urb->context)->motu;
+	struct motu_avb_urb *urb_ctx = (struct motu_avb_urb *)urb->context;
 	unsigned long flags;
 	unsigned int frames = 0, i;
 
@@ -538,7 +554,8 @@ static void playback_urb_complete(struct urb *urb)
 		list_add_tail(&((struct motu_avb_urb *)urb->context)->ready_list, &motu->ready_playback_urbs);
 		for (i = 0; i < urb->number_of_packets; i++)
 			frames += urb->iso_frame_desc[i].length;
-		motu->playback.substream->runtime->delay -= frames / motu->playback.frame_bytes;
+		if (!urb_ctx->was_silent)
+			motu->playback.substream->runtime->delay -= frames / motu->playback.frame_bytes;
 		spin_unlock_irqrestore(&motu->lock, flags);
 		if (motu->rate_feedback_count > 0)
 			playback_tasklet(motu);
@@ -870,12 +887,6 @@ static int start_usb_playback(struct motu_avb *motu)
 	motu->rate_feedback_count = 0;
 	motu->playback.period_pos = 0;
 	motu->playback.buffer_pos = 0;
-	spin_unlock_irq(&motu->lock);
-
-	if (err < 0)
-		return err;
-
-    spin_lock_irq(&motu->lock);
 
 	for (i = 0; i < motu->playback.queue_length; i++) {
 		list_add_tail(&motu->playback.urbs[i].ready_list, &motu->ready_playback_urbs);
@@ -890,10 +901,10 @@ static int start_usb_playback(struct motu_avb *motu)
 		stop_usb_playback(motu);
 		return -ENODEV;
 	}
-	if (!test_bit(USB_CAPTURE_RUNNING, &motu->states)) {
+	/*if (!test_bit(USB_CAPTURE_RUNNING, &motu->states)) {
 		stop_usb_playback(motu);
 		return -EIO;
-	}
+	}*/
 
 	set_bit(USB_PLAYBACK_RUNNING, &motu->states);
 	wake_up(&motu->alsa_playback_wait);
@@ -1064,7 +1075,11 @@ static int alloc_stream_urbs(struct motu_avb *motu, struct motu_avb_stream *stre
 	unsigned int period_size = params_period_size(params);
 	unsigned int freqmax = motu->rate + (motu->rate >> 1);
 	unsigned int maxsize = DIV_ROUND_UP(freqmax, 8000);
-	
+
+#ifdef DEBUG
+	dev_warn(&motu->dev->dev, "Motu AVB: Period size %u\n", period_size);
+#endif
+
 	if (maxsize > max_packet_size / stream->frame_bytes) 
 		maxsize = max_packet_size / stream->frame_bytes;
 	
@@ -1218,6 +1233,9 @@ static int capture_pcm_prepare(struct snd_pcm_substream *substream)
 #endif
 	motu->capture.needs_prepare = false;
 	
+	motu->capture.period_pos = 0;
+	motu->capture.buffer_pos = 0;
+
 	err = 0;
 	if (!test_bit(USB_CAPTURE_RUNNING, &motu->states))
 		err = start_usb_capture(motu);
@@ -1226,9 +1244,7 @@ static int capture_pcm_prepare(struct snd_pcm_substream *substream)
 	mutex_unlock(&motu->mutex);
 	if (err < 0)
 		return err;
-		
-	motu->capture.period_pos = 0;
-	motu->capture.buffer_pos = 0;
+
 	/*
 	 * The EHCI driver schedules the first packet of an iso stream at 10 ms
 	 * in the future, i.e., no data is actually captured for that long.
@@ -1263,7 +1279,7 @@ static int playback_pcm_prepare(struct snd_pcm_substream *substream)
 	motu->playback.first = true;
 	motu->playback.discard = 0;
 
-	unsigned int silent_urbs = time_silent * 8 / motu->capture.urb_packs;
+	unsigned int silent_urbs = time_silent * 8 / motu->playback.urb_packs;
 	silent_urbs = silent_urbs > 16 ? 16 : silent_urbs;
 	motu->playback.silent_urbs = silent_urbs;
 	motu->playback.start_frame_init = true;
@@ -1272,13 +1288,13 @@ static int playback_pcm_prepare(struct snd_pcm_substream *substream)
 	dev_warn(&motu->dev->dev, "Motu AVB: Timeframe to send silent urbs as playback startup %i\n", time_silent);
 	dev_warn(&motu->dev->dev, "Motu AVB: Number of silent urbs %u\n", motu->playback.silent_urbs);
 	
-	if (!test_bit(USB_CAPTURE_RUNNING, &motu->states)) {
+	/*if (!test_bit(USB_CAPTURE_RUNNING, &motu->states)) {
 		err = start_usb_capture(motu);
 		if (err < 0) {
 			mutex_unlock(&motu->mutex);
 			return err;
 		}
-	}
+	}*/
 
 	err = start_usb_playback(motu);
 	mutex_unlock(&motu->mutex);
@@ -1300,12 +1316,23 @@ static int playback_pcm_prepare(struct snd_pcm_substream *substream)
 static int capture_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 {
 	struct motu_avb *motu = substream->private_data;
+	unsigned long flags;
+	struct snd_pcm_runtime *runtime;
+	runtime = substream->runtime;
+
+#ifdef DEBUG
+	dev_warn(&motu->dev->dev, "Motu AVB: Capture trigger\n");
+#endif
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
 		if (!test_bit(USB_CAPTURE_RUNNING, &motu->states))
 			return -EIO;
+		spin_lock_irqsave(&motu->lock, flags);
+		motu->capture.buffer_pos = 0;
+		motu->capture.period_pos = 0;
 		set_bit(ALSA_CAPTURE_RUNNING, &motu->states);
+		spin_unlock_irqrestore(&motu->lock, flags);
 		return 0;
 	case SNDRV_PCM_TRIGGER_STOP:
 		clear_bit(ALSA_CAPTURE_RUNNING, &motu->states);
@@ -1318,12 +1345,23 @@ static int capture_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 static int playback_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 {
 	struct motu_avb *motu = substream->private_data;
+	unsigned long flags;
+	struct snd_pcm_runtime *runtime;
+	runtime = substream->runtime;
+
+#ifdef DEBUG
+	dev_warn(&motu->dev->dev, "Motu AVB: Playback trigger\n");
+#endif
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
 		if (!test_bit(USB_PLAYBACK_RUNNING, &motu->states))
 			return -EIO;
+		spin_lock_irqsave(&motu->lock, flags);
+		motu->playback.buffer_pos = 0;
+		motu->playback.period_pos = 0;
 		set_bit(ALSA_PLAYBACK_RUNNING, &motu->states);
+		spin_unlock_irqrestore(&motu->lock, flags);
 		return 0;
 	case SNDRV_PCM_TRIGGER_STOP:
 		clear_bit(ALSA_PLAYBACK_RUNNING, &motu->states);
