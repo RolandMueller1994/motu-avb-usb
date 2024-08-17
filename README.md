@@ -6,19 +6,21 @@ This version was tested with the Ultralite AVB ESS devices and tries to solve th
 
 ## Module parameters:
 
-midi: set 1 for devices that have a midi port, 0 for the ones that don't
+midi: Set to 1 for devices that have a midi port, 0 for the ones that don't
 
 vendor: 0 = use class compliant mode (24 channels in/out), 1 = vendor mode (64/32/24)
 
 channels: 0 = default (24 class compliant, 64/32/24 vendor mode), anything > 0 = number of channels in vendor mode. **Make sure to configure the device correctly before**.
 
-queue_urbs: 0 = no urbs will be queued at the start of playback. **This is only meant to be used for debugging.** 1 = 2ms of silent playback data queued at start of playback
+time_silent: The time in milliseconds of silent data to be submitted at the start of the playback stream. The default is 2ms which complies with XHCI implementation that requires 2ms of queued data for continuous ISOC stream. In case you are still experiencing channel hopping or decimated sound, you might want to increase this value. Values lower than 2 might lead to dropouts in the ISOC stream but it will reduce latency.
+
+frame_check: Default 0. If set to 1, the drivers tracks the start_frame of the playback urbs. In case the start_frame is further in the future than expected, the interface will be reset and the streams are restarted. **By default this option is disabled because it might not work on every XHCI controller but it is recommended to try using the option.**
 
 Important: vendor mode requires to patch and recompile the kernel! Check [this](https://linuxmusicians.com/viewtopic.php?p=139957&sid=5dd8fd68d6b6abe5f40f5fffbb7faafc#p139957) post on linux musicians forum: 
 
 it is recommended to set the parameters in the file /etc/modprobe.d/alsa-base.conf, e.g.
 
-	options motu midi=1 vendor=0 
+	options motu midi=1 vendor=0 frame_check=1
 
 You may also make linux load the module during boot to prevent the alsa usb audio driver to take control of your device.
 This is done by adding motu to file /etc/modules-load.d/modules.conf
@@ -38,16 +40,16 @@ Install dkms and the kernel source of your running kernel, then
 
 ##Build
 
-	sudo cp -r motu-avb-usb /usr/src/motu-avb-usb-1.1
-	sudo dkms add motu-avb-usb/1.1
-	sudo dkms build motu-avb-usb/1.1
-	sudo dkms install motu-avb-usb/1.1
+	sudo cp -r motu-avb-usb /usr/src/motu-avb-usb-1.3
+	sudo dkms add motu-avb-usb/1.3
+	sudo dkms build motu-avb-usb/1.3
+	sudo dkms install motu-avb-usb/1.3
 
 or run the install script
 
- 	sudo ./install.sh
+	sudo ./install.sh
 
 If you want to use vendor mode, make sure you have curl installed, then connect the device through ethernet and execute the curl command
 
-	 curl  --data 'json={"value":"USB2"}' <ip address of the device>/datastore/host/mode
-
+	curl  --data 'json={"value":"USB2"}' <ip address of the device>/datastore/host/mode
+	
