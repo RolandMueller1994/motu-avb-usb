@@ -19,7 +19,8 @@
 #include "usbaudio.h"
 #include "midi.h"
 
-// #define DEBUG
+#define DEBUG
+#define DEFAULT_ON_ISOC_ERROR 0
 
 MODULE_DESCRIPTION("Motu AVB ESS Driver");
 MODULE_AUTHOR("Roland Mueller <roland.mueller.1994@gmx.de>");
@@ -151,6 +152,7 @@ struct motu_avb {
 	} next_packet[DEFAULT_QUEUE_LENGTH];
 	
 	unsigned int next_playback_frame;
+	unsigned int next_capture_frame;
 };
 
 static DEFINE_MUTEX(devices_mutex);
@@ -508,14 +510,28 @@ static void playback_urb_complete(struct urb *urb)
 		abort_usb_playback(motu);
 		abort_alsa_playback(motu);
 		return;
+	} else if (unlikely(urb->status != 0)) {
+		dev_err(&motu->dev->dev, "URB status %i\n", urb->status);
+	} else if (unlikely(urb->error_count)) {
+		dev_err(&motu->dev->dev, "ISOC Error %i\n", urb->error_count);
+	}
+	for (i = 0; i < urb->number_of_packets; i++) {
+		unsigned int actLength = urb->iso_frame_desc[i].actual_length;
+		unsigned int length = urb->iso_frame_desc[i].length;
+		if (actLength != length) {
+			dev_err(&motu->dev->dev, "Length unequal %i: %u %u\n", i, actLength, length);
+		}	
+		if (urb->iso_frame_desc[i].status != 0) {
+			dev_err(&motu->dev->dev, "Packet status %i: %i\n", i, urb->iso_frame_desc[i].status);
+		}
 	}
 	
 	if (motu->playback.first) {
-		motu->next_playback_frame = urb->start_frame & 0x3ff;
+		motu->next_playback_frame = urb->start_frame /*& 0x3ff*/;
 		motu->playback.substream->runtime->delay = 0;
 	}
 
-	if (((urb->start_frame & 0x3ff) != motu->next_playback_frame) && frame_check && !motu->playback.start_frame_init) {
+	if (((urb->start_frame /*& 0x3ff*/) != motu->next_playback_frame) && frame_check && !motu->playback.start_frame_init) {
 		/*
 		If playback urbs are submitted to late, the host controller will schedule at the frame 
 		where it is able to process it. This will lead to dropouts in the iso stream which further
@@ -525,13 +541,12 @@ static void playback_urb_complete(struct urb *urb)
 		start_frame is masked with 0x3ff as this is where the EHCI driver wraps the frame number.
 		XHCI wouldn't need this.
 		*/
-		dev_err(&motu->dev->dev, "ISOC delay %u!\n", (urb->start_frame & 0x3ff) - motu->next_playback_frame);
+		dev_err(&motu->dev->dev, "ISOC delay %u!\n", (urb->start_frame /*& 0x3ff*/) - motu->next_playback_frame);
 		motu->playback.needs_prepare = true;
-		motu->capture.needs_prepare = true;
 		abort_usb_playback(motu);
 		abort_alsa_playback(motu);
 		abort_usb_capture(motu);
-	} else if (((urb->start_frame & 0x3ff) == motu->next_playback_frame) && frame_check && motu->playback.start_frame_init) {
+	} else if (((urb->start_frame /*& 0x3ff*/) == motu->next_playback_frame) && frame_check && motu->playback.start_frame_init) {
 		dev_warn(&motu->dev->dev, "Start frame check started!\n");
 		motu->playback.start_frame_init = false;
 	}
@@ -540,13 +555,13 @@ static void playback_urb_complete(struct urb *urb)
 	if (motu->playback.frame_print > 0) {
 		dev_warn(&motu->dev->dev,
 				"Playback start frame: %u, Masked %u; Expected playback frame: %u\n",
-				urb->start_frame, urb->start_frame & 0x3ff,
+				urb->start_frame, urb->start_frame /*& 0x3ff*/,
 				motu->next_playback_frame);
 		motu->playback.frame_print--;
 	}
 #endif
 	// The next urb should be exactly the number of iso packets we send per urb isn the future.
-	motu->next_playback_frame = (urb->start_frame + urb->number_of_packets) & 0x3ff;
+	motu->next_playback_frame = (urb->start_frame + urb->number_of_packets) /*& 0x3ff*/;
 
 	if (test_bit(USB_PLAYBACK_RUNNING, &motu->states)) {
 		/* append URB to FIFO */
@@ -573,6 +588,7 @@ static bool copy_capture_data(struct motu_avb_stream *stream, struct urb *urb,
 			      unsigned int frames)
 {
 	struct snd_pcm_runtime *runtime;
+	struct motu_avb *motu = ((struct motu_avb_urb *)urb->context)->motu;
 	unsigned int frame_bytes, frames1, i, cur_frames;
 	u8 *dest;
 	bool do_period_elapsed = false;
@@ -580,17 +596,87 @@ static bool copy_capture_data(struct motu_avb_stream *stream, struct urb *urb,
 	runtime = stream->substream->runtime;
 	frame_bytes = stream->frame_bytes;
 	for (i = 0; i < urb->number_of_packets; i++) {
+	unsigned int actLength = urb->iso_frame_desc[i].actual_length;
+	unsigned int length = urb->iso_frame_desc[i].actual_length;
+	if (urb->iso_frame_desc[i].status != 0) {
+		dev_err(&motu->dev->dev, "In length %i: %u", i, actLength);
+		dev_err(&motu->dev->dev, "In Packet status %i: %i\n", i, urb->iso_frame_desc[i].status);
+		switch (urb->iso_frame_desc[i].status) {
+			case -ENOENT:
+				dev_err(&motu->dev->dev, "ENOENT\n");
+				break;
+			case -EINPROGRESS:
+				dev_err(&motu->dev->dev, "EINPROGRESS\n");
+				break;
+			case -EPROTO:
+				dev_err(&motu->dev->dev, "EPROTO\n");
+				break;
+			case -EILSEQ:
+				dev_err(&motu->dev->dev, "EILSEQ\n");
+				break;
+			case -ETIME:
+				dev_err(&motu->dev->dev, "ETIME\n");
+				break;
+			case -ETIMEDOUT:
+				dev_err(&motu->dev->dev, "ETIMEDOUT\n");
+				break;
+			case -EPIPE:
+				dev_err(&motu->dev->dev, "EPIPE\n");
+				break;
+			case -ECOMM:
+				dev_err(&motu->dev->dev, "ECOMM\n");
+				break;
+			case -ENOSR:
+				dev_err(&motu->dev->dev, "ENOSR\n");
+				break;
+			case -EOVERFLOW:
+				dev_err(&motu->dev->dev, "EOVERFLOW\n");
+				break;
+			case -EREMOTEIO:
+				dev_err(&motu->dev->dev, "EREMOTEIO\n");
+				break;
+			case -ENODEV:
+				dev_err(&motu->dev->dev, "ENODEV\n");
+				break;
+			case -EXDEV:
+				dev_err(&motu->dev->dev, "EXDEV\n");
+				break;
+			case -EINVAL:
+				dev_err(&motu->dev->dev, "EINVAL\n");
+				break;
+			case -ECONNRESET:
+				dev_err(&motu->dev->dev, "ECONNRESET\n");
+				break;
+			case -ESHUTDOWN:
+				dev_err(&motu->dev->dev, "ESHUTDOWN\n");
+				break;
+			default:
+				dev_err(&motu->dev->dev, "Unknown\n");
+			}
+		}
 		dest = runtime->dma_area + stream->buffer_pos * frame_bytes;
-		cur_frames = urb->iso_frame_desc[i].actual_length / frame_bytes;
-		if (stream->buffer_pos + cur_frames <= runtime->buffer_size) {
-			memcpy(dest, urb->transfer_buffer + urb->iso_frame_desc[i].offset, cur_frames * frame_bytes);
+		if (urb->iso_frame_desc[i].status != 0) {
+			cur_frames = motu->playback.default_packet_size;
+			if (stream->buffer_pos + cur_frames <= runtime->buffer_size) {
+				memset(dest, 0, cur_frames * frame_bytes);
+			} else {
+				/* wrap around at end of ring buffer */
+				frames1 = runtime->buffer_size - stream->buffer_pos;
+				memset(dest, 0, frames1 * frame_bytes);
+				memset(runtime->dma_area, 0, (cur_frames - frames1) * frame_bytes);
+			}
 		} else {
-			/* wrap around at end of ring buffer */
-			frames1 = runtime->buffer_size - stream->buffer_pos;
-			memcpy(dest, urb->transfer_buffer + urb->iso_frame_desc[i].offset, frames1 * frame_bytes);
-			memcpy(runtime->dma_area,
-				   urb->transfer_buffer + urb->iso_frame_desc[i].offset + frames1 * frame_bytes,
-				   (cur_frames - frames1) * frame_bytes);
+			cur_frames = urb->iso_frame_desc[i].actual_length / frame_bytes;
+			if (stream->buffer_pos + cur_frames <= runtime->buffer_size) {
+				memcpy(dest, urb->transfer_buffer + urb->iso_frame_desc[i].offset, cur_frames * frame_bytes);
+			} else {
+				/* wrap around at end of ring buffer */
+				frames1 = runtime->buffer_size - stream->buffer_pos;
+				memcpy(dest, urb->transfer_buffer + urb->iso_frame_desc[i].offset, frames1 * frame_bytes);
+				memcpy(runtime->dma_area,
+					   urb->transfer_buffer + urb->iso_frame_desc[i].offset + frames1 * frame_bytes,
+					   (cur_frames - frames1) * frame_bytes);
+			}
 		}
 		stream->buffer_pos += cur_frames;
 		if (stream->buffer_pos >= runtime->buffer_size)
@@ -626,8 +712,20 @@ static void capture_urb_complete(struct urb *urb)
 		if (urb->status >= 0 && urb->iso_frame_desc[i].status >= 0) {
 			frames += urb->iso_frame_desc[i].actual_length /
 				stream->frame_bytes;
+		} else if (urb->status >= 0) {
+			frames = motu->playback.default_packet_size;
 		}
 	}
+
+	if (stream->first) {
+		motu->next_capture_frame = urb->start_frame;
+	}
+
+	if (((urb->start_frame /*& 0x3ff*/) != motu->next_capture_frame) && frame_check) {
+		dev_err(&motu->dev->dev, "Input frame delta %i\n", ((int) urb->start_frame) - ((int) motu->next_capture_frame));
+	}
+
+	motu->next_capture_frame = (urb->start_frame + urb->number_of_packets);
 
 	spin_lock_irqsave(&motu->lock, flags);
 	
@@ -652,8 +750,10 @@ static void capture_urb_complete(struct urb *urb)
 		for (i = 0; i< urb->number_of_packets; i++) {
 			if (urb->iso_frame_desc[i].status == 0) 
 				out_packet->packet_size[i] = urb->iso_frame_desc[i].actual_length / stream->frame_bytes;
+			else if (DEFAULT_ON_ISOC_ERROR)
+				out_packet->packet_size[i] = motu->playback.default_packet_size;
 			else
-				out_packet->packet_size[i] = 0;	
+				out_packet->packet_size[i] = 0;
 		}
 
 		err = usb_submit_urb(urb, GFP_ATOMIC);
